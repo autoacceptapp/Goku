@@ -38,8 +38,6 @@ import com.arif.goku.system.SmartContextManager
 import com.arif.goku.ui.LockScreenWakeActivity
 import com.example.MainActivity
 import com.example.R
-import com.k2fsa.sherpa.onnx.KeywordSpotter
-import com.k2fsa.sherpa.onnx.OnlineStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -251,8 +249,7 @@ class WakeWordService : Service() {
             ).coerceAtLeast(FRAME_SAMPLES * 4)
 
             var audioRecord: AudioRecord? = null
-            var keywordSpotter: KeywordSpotter? = null
-            var kwsStream: OnlineStream? = null
+            var kwsSession: SherpaKwsSession? = null
             var kwsInitAttemptedForReadyModel = false
             val pcmBuffer = ShortArray(FRAME_SAMPLES)
             val floatBuffer = FloatArray(FRAME_SAMPLES)
@@ -270,31 +267,16 @@ class WakeWordService : Service() {
                         val kwsState = kwsModelManager.refreshStatus()
                         val kwsReady = kwsState.hasOnnxFiles
 
-                        if (kwsReady && keywordSpotter == null && !kwsInitAttemptedForReadyModel) {
+                        if (kwsReady && kwsSession == null && !kwsInitAttemptedForReadyModel) {
                             kwsInitAttemptedForReadyModel = true
-                            val spotter = kwsModelManager.createKeywordSpotter()
-                            if (spotter != null) {
-                                val stream = try {
-                                    spotter.createStream()
-                                } catch (_: Throwable) {
-                                    releaseSherpaKws(null, spotter)
-                                    null
-                                }
-                                if (stream != null) {
-                                    keywordSpotter = spotter
-                                    kwsStream = stream
-                                }
-                            }
+                            kwsSession = kwsModelManager.createKeywordSpotterSession()
                         } else if (!kwsReady) {
                             kwsInitAttemptedForReadyModel = false
-                            if (keywordSpotter != null || kwsStream != null) {
-                                releaseSherpaKws(kwsStream, keywordSpotter)
-                                kwsStream = null
-                                keywordSpotter = null
-                            }
+                            kwsSession?.release()
+                            kwsSession = null
                         }
 
-                        val sherpaActive = keywordSpotter != null && kwsStream != null
+                        val sherpaActive = kwsSession != null
                         WakeWordBridge.setPowerSavingActive(ctx.wakeDutyCyclePowerSave)
                         val modeLabel = when {
                             ctx.wakeDutyCyclePowerSave && sherpaActive -> "POWER SAVE KWS (${ctx.batteryPercent}%)"
@@ -317,12 +299,7 @@ class WakeWordService : Service() {
                         releaseAudioRecord(audioRecord)
                         audioRecord = null
                         consecutiveSpeechFrames = 0
-                        if (keywordSpotter != null && kwsStream != null) {
-                            try {
-                                keywordSpotter.reset(kwsStream)
-                            } catch (_: Throwable) {
-                            }
-                        }
+                        kwsSession?.reset()
                         delay(220L)
                         continue
                     }
@@ -349,9 +326,8 @@ class WakeWordService : Service() {
                         continue
                     }
 
-                    val activeSpotter = keywordSpotter
-                    val activeStream = kwsStream
-                    if (activeSpotter != null && activeStream != null) {
+                    val activeSession = kwsSession
+                    if (activeSession != null) {
                         // Primary path: Real-time offline Sherpa-ONNX KeywordSpotter
                         try {
                             val samples = if (readCount == floatBuffer.size) {
@@ -363,13 +339,9 @@ class WakeWordService : Service() {
                                 FloatArray(readCount) { i -> pcmBuffer[i] / 32768.0f }
                             }
 
-                            activeStream.acceptWaveform(samples, SAMPLE_RATE_HZ)
-                            while (activeSpotter.isReady(activeStream)) {
-                                activeSpotter.decode(activeStream)
-                            }
-                            val detectedKeyword = activeSpotter.getResult(activeStream).keyword.trim()
+                            val detectedKeyword = activeSession.acceptWaveformAndDetect(samples, SAMPLE_RATE_HZ)
                             if (detectedKeyword.isNotEmpty()) {
-                                activeSpotter.reset(activeStream)
+                                activeSession.reset()
                                 val match = WakeWordMatcher.matchPhrase(detectedKeyword)
                                 val cooldownPassed = (System.currentTimeMillis() - lastTriggerTimeMs) > TRIGGER_COOLDOWN_MS
                                 if (match != null && cooldownPassed) {
@@ -379,9 +351,8 @@ class WakeWordService : Service() {
                             }
                         } catch (_: Throwable) {
                             // Native error: release KWS safely and drop to VAD fallback
-                            releaseSherpaKws(activeStream, activeSpotter)
-                            kwsStream = null
-                            keywordSpotter = null
+                            activeSession.release()
+                            kwsSession = null
                             WakeWordBridge.setEngineModeLabel("VAD + OFFLINE VERIFY")
                         }
 
@@ -417,20 +388,9 @@ class WakeWordService : Service() {
                     }
                 }
             } finally {
-                releaseSherpaKws(kwsStream, keywordSpotter)
+                kwsSession?.release()
                 releaseAudioRecord(audioRecord)
             }
-        }
-    }
-
-    private fun releaseSherpaKws(stream: OnlineStream?, spotter: KeywordSpotter?) {
-        try {
-            stream?.release()
-        } catch (_: Throwable) {
-        }
-        try {
-            spotter?.release()
-        } catch (_: Throwable) {
         }
     }
 

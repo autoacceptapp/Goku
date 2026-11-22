@@ -1,11 +1,7 @@
 package com.arif.goku.voice
 
 import android.content.Context
-import com.k2fsa.sherpa.onnx.FeatureConfig
-import com.k2fsa.sherpa.onnx.KeywordSpotter
-import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
-import com.k2fsa.sherpa.onnx.OnlineModelConfig
-import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
+import android.content.res.AssetManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -91,13 +87,16 @@ class KwsModelManager(context: Context) {
     fun getKeywordsFile(): File? = File(modelDir, "keywords.txt").takeIf { it.isFile }
 
     /**
-     * Instantiates the official Sherpa-ONNX [KeywordSpotter] backed by the locally downloaded
-     * Zipformer GigaSpeech ONNX model and `keywords.txt` ("HEY GOKU" & "GOKU STOP").
+     * Opens a live Sherpa-ONNX KeywordSpotter + OnlineStream session backed by the downloaded
+     * Zipformer GigaSpeech ONNX weights in `filesDir/kws_model` and the bundled official
+     * `sherpa-onnx.aar` (loaded dynamically so local/offline builds compile even when `app/libs/`
+     * is empty).
      *
-     * Returns `null` if ONNX files are missing or native runtime initialization fails (e.g. JVM
-     * unit tests or unsupported ABI), allowing [WakeWordService] to fall back cleanly to VAD.
+     * Returns `null` if ONNX files are missing, the AAR is not bundled, or native initialization
+     * fails, allowing [WakeWordService] to fall back cleanly to VAD + offline SpeechRecognizer.
      */
-    fun createKeywordSpotter(): KeywordSpotter? {
+    fun createKeywordSpotterSession(): SherpaKwsSession? {
+        if (!isSherpaOnnxClassAvailable()) return null
         val encoder = getEncoderFile() ?: return null
         val decoder = getDecoderFile() ?: return null
         val joiner = getJoinerFile() ?: return null
@@ -111,33 +110,13 @@ class KwsModelManager(context: Context) {
             }
         } ?: return null
 
-        return try {
-            val config = KeywordSpotterConfig(
-                featConfig = FeatureConfig(
-                    sampleRate = 16000,
-                    featureDim = 80
-                ),
-                modelConfig = OnlineModelConfig(
-                    transducer = OnlineTransducerModelConfig(
-                        encoder = encoder.absolutePath,
-                        decoder = decoder.absolutePath,
-                        joiner = joiner.absolutePath
-                    ),
-                    tokens = tokens.absolutePath,
-                    numThreads = 2,
-                    debug = false,
-                    provider = "cpu"
-                ),
-                maxActivePaths = 4,
-                keywordsFile = keywordsFile.absolutePath,
-                keywordsScore = 1.5f,
-                keywordsThreshold = 0.25f,
-                numTrailingBlanks = 2
-            )
-            KeywordSpotter(assetManager = null, config = config)
-        } catch (_: Throwable) {
-            null
-        }
+        return SherpaKwsSession.create(
+            encoderPath = encoder.absolutePath,
+            decoderPath = decoder.absolutePath,
+            joinerPath = joiner.absolutePath,
+            tokensPath = tokens.absolutePath,
+            keywordsPath = keywordsFile.absolutePath
+        )
     }
 
     fun cancelDownload() {
@@ -367,6 +346,174 @@ class KwsModelManager(context: Context) {
                 true
             } catch (_: Throwable) {
                 false
+            }
+        }
+    }
+}
+
+/**
+ * Runtime-bound wrapper around `com.k2fsa.sherpa.onnx.KeywordSpotter` and `OnlineStream`.
+ *
+ * Pre-resolves all JNI wrapper `Method` handles once on creation so the 16 kHz real-time PCM loop
+ * incurs zero reflective lookup overhead, while keeping the app buildable even when `app/libs/`
+ * has no `.aar` present locally.
+ */
+class SherpaKwsSession private constructor(
+    private val spotter: Any,
+    private val stream: Any,
+    private val acceptWaveformMethod: java.lang.reflect.Method,
+    private val acceptWaveformSamplesFirst: Boolean,
+    private val isReadyMethod: java.lang.reflect.Method,
+    private val decodeMethod: java.lang.reflect.Method,
+    private val getResultMethod: java.lang.reflect.Method,
+    private val getKeywordMethod: java.lang.reflect.Method,
+    private val resetMethod: java.lang.reflect.Method,
+    private val streamReleaseMethod: java.lang.reflect.Method,
+    private val spotterReleaseMethod: java.lang.reflect.Method
+) {
+    fun acceptWaveformAndDetect(samples: FloatArray, sampleRate: Int): String {
+        if (acceptWaveformSamplesFirst) {
+            acceptWaveformMethod.invoke(stream, samples, sampleRate)
+        } else {
+            acceptWaveformMethod.invoke(stream, sampleRate, samples)
+        }
+        while (isReadyMethod.invoke(spotter, stream) == true) {
+            decodeMethod.invoke(spotter, stream)
+        }
+        val result = getResultMethod.invoke(spotter, stream) ?: return ""
+        return (getKeywordMethod.invoke(result) as? String)?.trim().orEmpty()
+    }
+
+    fun reset() {
+        try {
+            resetMethod.invoke(spotter, stream)
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun release() {
+        try {
+            streamReleaseMethod.invoke(stream)
+        } catch (_: Throwable) {
+        }
+        try {
+            spotterReleaseMethod.invoke(spotter)
+        } catch (_: Throwable) {
+        }
+    }
+
+    companion object {
+        private const val PKG = "com.k2fsa.sherpa.onnx"
+
+        fun create(
+            encoderPath: String,
+            decoderPath: String,
+            joinerPath: String,
+            tokensPath: String,
+            keywordsPath: String
+        ): SherpaKwsSession? {
+            var spotterInstance: Any? = null
+            var streamInstance: Any? = null
+            return try {
+                val cl = SherpaKwsSession::class.java.classLoader
+                val featureConfigCls = Class.forName("$PKG.FeatureConfig", true, cl)
+                val transducerCls = Class.forName("$PKG.OnlineTransducerModelConfig", true, cl)
+                val modelConfigCls = Class.forName("$PKG.OnlineModelConfig", true, cl)
+                val kwsConfigCls = Class.forName("$PKG.KeywordSpotterConfig", true, cl)
+                val spotterCls = Class.forName("$PKG.KeywordSpotter", true, cl)
+                val streamCls = Class.forName("$PKG.OnlineStream", true, cl)
+                val resultCls = Class.forName("$PKG.KeywordSpotterResult", true, cl)
+
+                val featConfig = featureConfigCls.getDeclaredConstructor().newInstance()
+                setRequired(featConfig, "setSampleRate", 16000, Int::class.javaPrimitiveType!!)
+                setRequired(featConfig, "setFeatureDim", 80, Int::class.javaPrimitiveType!!)
+
+                val transducerConfig = transducerCls.getDeclaredConstructor().newInstance()
+                setRequired(transducerConfig, "setEncoder", encoderPath, String::class.java)
+                setRequired(transducerConfig, "setDecoder", decoderPath, String::class.java)
+                setRequired(transducerConfig, "setJoiner", joinerPath, String::class.java)
+
+                val modelConfig = modelConfigCls.getDeclaredConstructor().newInstance()
+                setRequired(modelConfig, "setTransducer", transducerConfig, transducerCls)
+                setRequired(modelConfig, "setTokens", tokensPath, String::class.java)
+                setOptional(modelConfig, "setNumThreads", 2, Int::class.javaPrimitiveType!!)
+                setOptional(modelConfig, "setDebug", false, Boolean::class.javaPrimitiveType!!)
+                setOptional(modelConfig, "setProvider", "cpu", String::class.java)
+
+                val kwsConfig = kwsConfigCls.getDeclaredConstructor().newInstance()
+                setRequired(kwsConfig, "setFeatConfig", featConfig, featureConfigCls)
+                setRequired(kwsConfig, "setModelConfig", modelConfig, modelConfigCls)
+                setOptional(kwsConfig, "setMaxActivePaths", 4, Int::class.javaPrimitiveType!!)
+                setRequired(kwsConfig, "setKeywordsFile", keywordsPath, String::class.java)
+                setOptional(kwsConfig, "setKeywordsScore", 1.5f, Float::class.javaPrimitiveType!!)
+                setOptional(kwsConfig, "setKeywordsThreshold", 0.25f, Float::class.javaPrimitiveType!!)
+                setOptional(kwsConfig, "setNumTrailingBlanks", 2, Int::class.javaPrimitiveType!!)
+
+                val ctor = spotterCls.getConstructor(AssetManager::class.java, kwsConfigCls)
+                spotterInstance = ctor.newInstance(null, kwsConfig)
+
+                streamInstance = try {
+                    spotterCls.getMethod("createStream", String::class.java).invoke(spotterInstance, "")
+                } catch (_: NoSuchMethodException) {
+                    spotterCls.getMethod("createStream").invoke(spotterInstance)
+                } ?: return null
+
+                val (acceptMethod, samplesFirst) = try {
+                    streamCls.getMethod(
+                        "acceptWaveform",
+                        FloatArray::class.java,
+                        Int::class.javaPrimitiveType!!
+                    ) to true
+                } catch (_: NoSuchMethodException) {
+                    streamCls.getMethod(
+                        "acceptWaveform",
+                        Int::class.javaPrimitiveType!!,
+                        FloatArray::class.java
+                    ) to false
+                }
+
+                val isReadyMethod = spotterCls.getMethod("isReady", streamCls)
+                val decodeMethod = spotterCls.getMethod("decode", streamCls)
+                val getResultMethod = spotterCls.getMethod("getResult", streamCls)
+                val getKeywordMethod = resultCls.getMethod("getKeyword")
+                val resetMethod = spotterCls.getMethod("reset", streamCls)
+                val streamReleaseMethod = streamCls.getMethod("release")
+                val spotterReleaseMethod = spotterCls.getMethod("release")
+
+                SherpaKwsSession(
+                    spotter = spotterInstance,
+                    stream = streamInstance,
+                    acceptWaveformMethod = acceptMethod,
+                    acceptWaveformSamplesFirst = samplesFirst,
+                    isReadyMethod = isReadyMethod,
+                    decodeMethod = decodeMethod,
+                    getResultMethod = getResultMethod,
+                    getKeywordMethod = getKeywordMethod,
+                    resetMethod = resetMethod,
+                    streamReleaseMethod = streamReleaseMethod,
+                    spotterReleaseMethod = spotterReleaseMethod
+                )
+            } catch (_: Throwable) {
+                try {
+                    streamInstance?.let { it.javaClass.getMethod("release").invoke(it) }
+                } catch (_: Throwable) {
+                }
+                try {
+                    spotterInstance?.let { it.javaClass.getMethod("release").invoke(it) }
+                } catch (_: Throwable) {
+                }
+                null
+            }
+        }
+
+        private fun setRequired(target: Any, methodName: String, value: Any, paramType: Class<*>) {
+            target.javaClass.getMethod(methodName, paramType).invoke(target, value)
+        }
+
+        private fun setOptional(target: Any, methodName: String, value: Any, paramType: Class<*>) {
+            try {
+                target.javaClass.getMethod(methodName, paramType).invoke(target, value)
+            } catch (_: NoSuchMethodException) {
             }
         }
     }

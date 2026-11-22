@@ -64,6 +64,11 @@ android {
     buildConfig = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
+  packaging {
+    jniLibs {
+      pickFirsts += "**/libc++_shared.so"
+    }
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
@@ -109,9 +114,7 @@ dependencies {
   implementation(libs.commons.compress)
   implementation(libs.mediapipe.tasks.genai)
   implementation(libs.androidx.work.runtime.ktx)
-  implementation(libs.sherpa.onnx) {
-    exclude(group = "com.github.k2-fsa.sherpa-onnx", module = "sherpa-onnx-jvm")
-  }
+  implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
   // implementation(libs.coil.compose)
   // implementation(libs.converter.moshi)
   // implementation(libs.firebase.ai)
