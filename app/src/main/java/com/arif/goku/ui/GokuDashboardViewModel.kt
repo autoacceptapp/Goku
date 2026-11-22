@@ -17,6 +17,7 @@ import com.arif.goku.action.GokuAction
 import com.arif.goku.action.GokuActionType
 import com.arif.goku.adb.LocalAdbManager
 import com.arif.goku.adb.LocalAdbStatus
+import com.arif.goku.backup.BrainBackupManager
 import com.arif.goku.brain.ActiveBrainTier
 import com.arif.goku.brain.BrainConnectionStatus
 import com.arif.goku.brain.BrainRouteResult
@@ -26,14 +27,23 @@ import com.arif.goku.brain.GeminiChatClient
 import com.arif.goku.brain.OfflineLlmEngine
 import com.arif.goku.brain.OfflineLlmState
 import com.arif.goku.brain.ZeroCopyBridge
+import com.arif.goku.calls.CallVoiceDelegate
+import com.arif.goku.calls.SmartCallBridge
+import com.arif.goku.calls.SmartCallManager
+import com.arif.goku.calls.SmartCallUiState
 import com.arif.goku.data.GokuUserSettings
 import com.arif.goku.data.SecurePrefs
+import com.arif.goku.data.db.CallSummaryEntity
 import com.arif.goku.data.db.GokuDatabase
+import com.arif.goku.data.db.HabitActionType
 import com.arif.goku.data.db.MemoryCategory
 import com.arif.goku.data.db.MemoryEntity
 import com.arif.goku.data.db.MemoryManager
+import com.arif.goku.data.db.SkillEntity
 import com.arif.goku.dev.GitHubBuildReport
 import com.arif.goku.dev.GokuDevManager
+import com.arif.goku.habits.HabitPredictor
+import com.arif.goku.habits.PredictedHabitSuggestion
 import com.arif.goku.notifications.CapturedNotification
 import com.arif.goku.notifications.GokuNotificationListener
 import com.arif.goku.overlay.GokuOverlayService
@@ -50,11 +60,17 @@ import com.arif.goku.safety.SafetyState
 import com.arif.goku.safety.ScreenCoPilot
 import com.arif.goku.safety.ScreenMistakeBlocker
 import com.arif.goku.safety.VoiceConfirmationDecision
+import com.arif.goku.skills.SkillEngine
+import com.arif.goku.skills.SkillEngineUiState
+import com.arif.goku.skills.TeachByExampleRecorder
+import com.arif.goku.skills.TeachSessionState
 import com.arif.goku.system.FocusShieldManager
 import com.arif.goku.system.FocusShieldRuntime
 import com.arif.goku.system.FocusShieldState
 import com.arif.goku.system.FreezableAppInfo
 import com.arif.goku.system.GhostSettingType
+import com.arif.goku.system.LogcatDiagnosisReport
+import com.arif.goku.system.LogcatDoctor
 import com.arif.goku.system.PhoneDoctorReport
 import com.arif.goku.system.SmartContextManager
 import com.arif.goku.system.SmartContextState
@@ -71,9 +87,11 @@ import com.arif.goku.worker.BackgroundTaskItem
 import com.arif.goku.worker.BackgroundTaskQueue
 import com.arif.goku.worker.BackgroundTaskStatus
 import com.arif.goku.worker.BackgroundTaskType
+import com.arif.goku.worker.DreamModeScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -109,7 +127,9 @@ data class ChatMessage(
 
 enum class SettingsTab {
     BRAIN,
+    SKILLS_BACKUP,
     PILOT_QUEUE,
+    CALLS_HABITS,
     MEMORY,
     WAKE_FOCUS,
     DEV,
@@ -130,6 +150,9 @@ data class DashboardUiState(
     val hasSmsPermission: Boolean = false,
     val hasContactsPermission: Boolean = false,
     val hasPostNotifPermission: Boolean = true,
+    val hasReadPhoneStatePermission: Boolean = false,
+    val hasReadCallLogPermission: Boolean = false,
+    val hasAnswerCallsPermission: Boolean = false,
     val isBatteryUnrestricted: Boolean = false,
     val isSettingsOpen: Boolean = false,
     val activeSettingsTab: SettingsTab = SettingsTab.BRAIN,
@@ -223,28 +246,122 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
             triggerEmergencyStop("Voice kill switch heard: \"$phrase\"")
         },
         onFinalSpeechResult = { spoken ->
-            handleUserInput(spoken, fromVoice = true)
+            if (smartCallManager.isListeningForCallerMessage()) {
+                smartCallManager.onCallerTranscriptCaptured(spoken)
+            } else {
+                handleUserInput(spoken, fromVoice = true)
+            }
         },
         onVoiceError = { errorMsg ->
             showBanner(errorMsg)
         }
     )
 
+    val smartCallManager = SmartCallManager(
+        context = appContext,
+        securePrefs = securePrefs,
+        callSummaryDao = gokuDatabase.callSummaryDao(),
+        memoryManager = memoryManager,
+        scope = viewModelScope,
+        voiceDelegate = object : CallVoiceDelegate {
+            override fun speakGreetingThenListen(greetingHindi: String, onReadyToListen: () -> Unit) {
+                voiceManager.speakHindiWithCallback(greetingHindi) {
+                    onReadyToListen()
+                    if (_uiState.value.hasMicPermission) {
+                        voiceManager.startListening(isContinuousWindow = false)
+                    }
+                }
+            }
+
+            override fun speakAlertHindi(messageHindi: String) {
+                voiceManager.speakHindi(messageHindi, reopenMicAfterSpeaking = false)
+            }
+
+            override fun stopVoice() {
+                voiceManager.emergencyStop()
+            }
+        }
+    )
+
+    val habitPredictor = HabitPredictor(
+        context = appContext,
+        habitDao = gokuDatabase.habitDao(),
+        securePrefs = securePrefs
+    )
+
+    val skillEngine = SkillEngine(
+        context = appContext,
+        skillDao = gokuDatabase.skillDao(),
+        actionExecutor = actionExecutor,
+        adbManager = localAdbManager,
+        brainRouter = brainRouter,
+        universalPilot = universalPilot,
+        onSpeakStep = { spoken ->
+            voiceManager.speakHindi(spoken, reopenMicAfterSpeaking = false)
+        }
+    )
+
+    val teachRecorder = TeachByExampleRecorder(
+        selfPackageName = appContext.packageName,
+        skillDao = gokuDatabase.skillDao(),
+        brainRouter = brainRouter
+    )
+
+    val logcatDoctor = LogcatDoctor(
+        context = appContext,
+        adbManager = localAdbManager,
+        brainRouter = brainRouter
+    )
+
+    val brainBackupManager = BrainBackupManager(
+        context = appContext,
+        db = gokuDatabase,
+        securePrefs = securePrefs
+    )
+
     val voiceStatus: StateFlow<VoiceUiStatus> = voiceManager.status
+    val smartCallState: StateFlow<SmartCallUiState> = smartCallManager.state
+    val callSummaries: StateFlow<List<CallSummaryEntity>> = smartCallManager.recentSummaries.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = emptyList()
+    )
+    val activeHabitSuggestion: StateFlow<PredictedHabitSuggestion?> = habitPredictor.activeSuggestion
+    val predictedHabits: StateFlow<List<PredictedHabitSuggestion>> = habitPredictor.allPredictedHabits
+
+    val skills: StateFlow<List<SkillEntity>> = skillEngine.allSkills.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = emptyList()
+    )
+    val skillEngineState: StateFlow<SkillEngineUiState> = skillEngine.state
+    val teachState: StateFlow<TeachSessionState> = teachRecorder.state
+    val logcatReport: StateFlow<LogcatDiagnosisReport?> = logcatDoctor.latestReport
+    val isDiagnosingLogcat: StateFlow<Boolean> = logcatDoctor.isDiagnosing
+    private val _isBackupBusy = MutableStateFlow(false)
+    val isBackupBusy: StateFlow<Boolean> = _isBackupBusy.asStateFlow()
 
     private var activeChatJob: Job? = null
     private var activePilotJob: Job? = null
+    private var activeSkillJob: Job? = null
     private var lastOrbTapMs: Long = 0L
+    private var lastSpokenHabitId: String? = null
+    private var pendingBackupPassphrase: String = ""
 
     init {
         localAdbManager.startMdnsDiscovery()
         observeOverlayBridge()
         observePhase3Bridges()
         observePhase5Bridges()
+        observePhase6Bridges()
+        observePhase7Bridges()
         restorePersistedChatHistory()
         refreshSystemStatuses()
         if (securePrefs.isWakeWordEnabled() && hasPermission(Manifest.permission.RECORD_AUDIO)) {
             WakeWordService.start(appContext)
+        }
+        if (securePrefs.isDreamModeEnabled()) {
+            DreamModeScheduler.scheduleOvernight(appContext)
         }
     }
 
@@ -349,6 +466,95 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
+    private fun observePhase6Bridges() {
+        // 1. Live Telephony / InCallService signals -> SmartCallManager 30s Auto-Answer Engine
+        viewModelScope.launch {
+            SmartCallBridge.signals.collect { signal ->
+                smartCallManager.onIncomingSignal(signal)
+            }
+        }
+
+        // 2. Smart Call spam / unknown caller alert -> Chat + Banner
+        viewModelScope.launch {
+            smartCallManager.spamAlerts.collect { alertHindi ->
+                showBanner(alertHindi)
+                appendMessage(ChatSender.SYSTEM, "[Smart Call Alert] $alertHindi", isAlert = true)
+            }
+        }
+
+        // 3. Smart Call auto-answer completion -> Post-call Hindi voice & card summary for Arif
+        viewModelScope.launch {
+            smartCallManager.completions.collect { event ->
+                appendMessage(
+                    sender = ChatSender.GOKU,
+                    text = "[Smart Call Summary] ${event.spokenNoticeHindi}",
+                    isAlert = event.summaryEntity.isSpamOrUnknown
+                )
+                showBanner("Call summary saved: ${event.summaryEntity.callerName}")
+                voiceManager.speakHindi(event.spokenNoticeHindi, reopenMicAfterSpeaking = false)
+            }
+        }
+
+        // 4. Passive App Launch logging from GokuAccessibilityService -> HabitPredictor
+        viewModelScope.launch {
+            GokuAccessibilityService.currentForegroundPackage.collect { pkg ->
+                if (pkg.isNotBlank()) {
+                    val logged = habitPredictor.logAppLaunch(pkg)
+                    if (logged) {
+                        habitPredictor.evaluatePredictions()
+                    }
+                }
+            }
+        }
+
+        // 5. Floating Orb Habit Suggestion 1-tap Run / Ignore decisions
+        viewModelScope.launch {
+            OverlayBridge.habitDecisions.collect { decision ->
+                val match = habitPredictor.allPredictedHabits.value
+                    .firstOrNull { it.id == decision.suggestionId }
+                    ?: habitPredictor.activeSuggestion.value?.takeIf { it.id == decision.suggestionId }
+                if (decision.runNow && match != null) {
+                    runPredictedHabit(match)
+                } else {
+                    habitPredictor.dismissSuggestion(decision.suggestionId)
+                }
+            }
+        }
+
+        // 6. Gentle periodic Habit Predictor scan every 5 minutes
+        viewModelScope.launch {
+            while (true) {
+                val suggestion = habitPredictor.evaluatePredictions()
+                if (suggestion != null && suggestion.id != lastSpokenHabitId &&
+                    voiceStatus.value.engineState == VoiceEngineState.IDLE &&
+                    !pilotState.value.isRunning
+                ) {
+                    lastSpokenHabitId = suggestion.id
+                    showBanner(suggestion.promptHindi)
+                }
+                delay(5 * 60 * 1000L)
+            }
+        }
+    }
+
+    private fun observePhase7Bridges() {
+        // Feed live Accessibility events into Smart Teach-by-Example while recording
+        viewModelScope.launch {
+            GokuAccessibilityService.screenSignals.collect { signal ->
+                if (teachRecorder.state.value.isRecording) {
+                    teachRecorder.onAccessibilitySignal(signal)
+                }
+            }
+        }
+
+        // Sync Teach Mode recording flag to Floating Orb button (TEACH <-> DONE)
+        viewModelScope.launch {
+            teachRecorder.state.collect { state ->
+                OverlayBridge.setTeaching(state.isRecording)
+            }
+        }
+    }
+
     private fun observeOverlayBridge() {
         // Sync live Orb state (Idle / Listening / Acting / Pilot) to the Floating Overlay Orb
         viewModelScope.launch {
@@ -367,7 +573,7 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
             }
         }
 
-        // Listen for 1-tap STOP or Orb tap events coming from the Floating Overlay Orb
+        // Listen for 1-tap STOP, Orb tap, or TEACH events coming from the Floating Overlay Orb
         viewModelScope.launch {
             OverlayBridge.commands.collect { cmd ->
                 when (cmd) {
@@ -375,6 +581,13 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
                     OverlayCommand.TAP_ORB -> {
                         if (_uiState.value.hasMicPermission) {
                             voiceManager.startListening(isContinuousWindow = false)
+                        }
+                    }
+                    OverlayCommand.TOGGLE_TEACH -> {
+                        if (teachRecorder.state.value.isRecording) {
+                            finishTeachMode()
+                        } else {
+                            startTeachMode()
                         }
                     }
                 }
@@ -387,6 +600,9 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
         val callGranted = hasPermission(Manifest.permission.CALL_PHONE)
         val smsGranted = hasPermission(Manifest.permission.SEND_SMS)
         val contactsGranted = hasPermission(Manifest.permission.READ_CONTACTS)
+        val readPhoneStateGranted = hasPermission(Manifest.permission.READ_PHONE_STATE)
+        val readCallLogGranted = hasPermission(Manifest.permission.READ_CALL_LOG)
+        val answerCallsGranted = hasPermission(Manifest.permission.ANSWER_PHONE_CALLS)
         val postNotifGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             hasPermission(Manifest.permission.POST_NOTIFICATIONS)
         } else {
@@ -412,6 +628,7 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
         GokuNotificationListener.refreshListenerStatus(appContext)
         kwsModelManager.refreshStatus()
         focusShieldManager.refreshMutedCount()
+        smartCallManager.refreshRoleStatus()
 
         _uiState.update {
             it.copy(
@@ -423,6 +640,9 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
                 hasSmsPermission = smsGranted,
                 hasContactsPermission = contactsGranted,
                 hasPostNotifPermission = postNotifGranted,
+                hasReadPhoneStatePermission = readPhoneStateGranted,
+                hasReadCallLogPermission = readCallLogGranted,
+                hasAnswerCallsPermission = answerCallsGranted,
                 isBatteryUnrestricted = batteryUnrestricted
             )
         }
@@ -431,6 +651,10 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
             showBanner(lowBatteryHindiAlert)
             appendMessage(ChatSender.SYSTEM, lowBatteryHindiAlert, isAlert = true)
             voiceManager.speakHindi(lowBatteryHindiAlert, reopenMicAfterSpeaking = false)
+        }
+
+        viewModelScope.launch {
+            habitPredictor.evaluatePredictions()
         }
 
         if (!smartCtx.isLowBatteryMode) {
@@ -504,8 +728,16 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
         activeChatJob = null
         activePilotJob?.cancel()
         activePilotJob = null
+        activeSkillJob?.cancel()
+        activeSkillJob = null
         universalPilot.cancel(reason)
+        skillEngine.cancel(reason)
+        if (teachRecorder.state.value.isRecording) {
+            teachRecorder.cancelRecording(reason)
+        }
+        smartCallManager.cancelEmergencyStop(reason)
         OverlayBridge.dismissMistakeWarning()
+        OverlayBridge.dismissHabitSuggestion()
         backgroundQueue.cancelAllActive()
         geminiClient.cancelActiveRequest()
         voiceManager.emergencyStop()
@@ -520,7 +752,7 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
         }
         appendMessage(
             ChatSender.SYSTEM,
-            "Goku Stop triggered ($reason) — TTS, mic, Pilot, aur running actions turant band kar diye gaye.",
+            "Goku Stop triggered ($reason) — TTS, mic, Pilot, Smart Call, aur running actions turant band kar diye gaye.",
             isAlert = true
         )
     }
@@ -563,6 +795,11 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
         }
 
         appendMessage(ChatSender.USER, text)
+
+        // Phase 6 passive habit logging for repeated commands
+        viewModelScope.launch {
+            habitPredictor.logVoiceCommand(text)
+        }
 
         // 3. Explicit Personal Memory Vault check ("Yaad rakhna..." / "Bhool jaao...") before SafetyGuard
         val lower = text.lowercase()
@@ -607,6 +844,28 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
         }
         if (securePrefs.isUniversalPilotEnabled() && UniversalAppPilot.isPilotCommand(text)) {
             startUniversalPilot(UniversalAppPilot.extractPilotGoal(text))
+            return
+        }
+
+        // 4.6 Phase 7 Voice Triggers: Smart Teach-by-Example ("seekh lo" -> "seekh liya") + Saved Skills
+        if (isStartTeachCommand(lower)) {
+            val hint = extractTeachHint(text)
+            startTeachMode(hint)
+            return
+        }
+        if (teachRecorder.state.value.isRecording && isFinishTeachCommand(lower)) {
+            finishTeachMode()
+            return
+        }
+        if (lower.contains("logcat") && (lower.contains("check") || lower.contains("diagnos") || lower.contains("doctor") || lower.contains("error"))) {
+            runLogcatSelfDiagnosis("Voice logcat request")
+            return
+        }
+
+        // Check offline Learned Skills first before hitting online BrainRouter
+        val matchedSkill = SkillEngine.matchBestSkill(text, skills.value)
+        if (matchedSkill != null) {
+            runLearnedSkill(matchedSkill)
             return
         }
 
@@ -1357,6 +1616,354 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
         showBanner("Finished background tasks cleared.")
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 6: Smart Call (30s Auto-Answer & Talk) + Habit Predictor Actions
+    // -------------------------------------------------------------------------
+
+    fun toggleSmartCall(enabled: Boolean) {
+        securePrefs.setSmartCallEnabled(enabled)
+        if (!enabled) {
+            smartCallManager.cancelEmergencyStop("Smart Call turned OFF")
+        }
+        val msg = if (enabled) {
+            "Smart Call ON hai (${securePrefs.getSmartCallDelaySeconds()}s baad auto-answer + speakerphone)."
+        } else {
+            "Smart Call OFF kar diya gaya."
+        }
+        showBanner(msg)
+    }
+
+    fun setSmartCallDelay(seconds: Int) {
+        securePrefs.setSmartCallDelaySeconds(seconds)
+        showBanner("Smart Call countdown ${seconds.coerceIn(5, 60)} seconds set ho gaya.")
+    }
+
+    fun toggleSmartCallSpamAlert(enabled: Boolean) {
+        securePrefs.setSmartCallSpamAlertEnabled(enabled)
+        showBanner(if (enabled) "Spam / Unknown caller alert ON." else "Spam / Unknown caller alert OFF.")
+    }
+
+    fun saveSmartCallOwnerName(name: String) {
+        securePrefs.setSmartCallOwnerName(name)
+        val saved = securePrefs.getSmartCallOwnerName()
+        showBanner("Smart Call greeting owner name '$saved' save ho gaya.")
+    }
+
+    fun startSmartCallTestTimer() {
+        closeSettings()
+        val delaySec = securePrefs.getSmartCallDelaySeconds()
+        smartCallManager.startTestCountdownSimulation(
+            testNumber = "+91 9876543210",
+            overrideDelaySeconds = delaySec
+        )
+        showBanner("Smart Call ${delaySec}s test countdown shuru hua. Cancel ya 'Goku stop' bolkar rok sakte hain.")
+    }
+
+    fun cancelSmartCall() {
+        smartCallManager.cancelEmergencyStop("User cancelled")
+        showBanner("Smart Call countdown / session cancel kar diya gaya.")
+    }
+
+    fun deleteCallSummary(id: Long) {
+        viewModelScope.launch {
+            smartCallManager.deleteCallSummary(id)
+            showBanner("Call summary delete kar diya gaya.")
+        }
+    }
+
+    fun toggleHabitPredictor(enabled: Boolean) {
+        securePrefs.setHabitPredictorEnabled(enabled)
+        if (!enabled) {
+            OverlayBridge.dismissHabitSuggestion()
+            showBanner("Habit Predictor OFF.")
+        } else {
+            viewModelScope.launch {
+                habitPredictor.evaluatePredictions()
+            }
+            showBanner("Habit Predictor ON. Goku aapke routine apps/commands observe karega.")
+        }
+    }
+
+    fun refreshHabitPredictions() {
+        viewModelScope.launch {
+            val top = habitPredictor.evaluatePredictions()
+            showBanner(
+                top?.promptHindi ?: "Abhi is time window (±20 min) mein koi 3+ repeated habit nahi mili."
+            )
+        }
+    }
+
+    fun runPredictedHabit(habit: PredictedHabitSuggestion) {
+        habitPredictor.markExecuted(habit.id)
+        closeSettings()
+        when (habit.actionType) {
+            HabitActionType.APP_LAUNCH -> {
+                val launchIntent = appContext.packageManager.getLaunchIntentForPackage(habit.target)
+                if (launchIntent != null) {
+                    launchIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    runCatching {
+                        appContext.startActivity(launchIntent)
+                        val msg = "${habit.displayLabel} chalu kar diya hai."
+                        appendMessage(ChatSender.GOKU, msg)
+                        showBanner(msg)
+                        voiceManager.speakHindi(msg, reopenMicAfterSpeaking = false)
+                    }.onFailure {
+                        executeStructuredAction(
+                            GokuAction(GokuActionType.OPEN_APP, target = habit.displayLabel),
+                            speakResult = true
+                        )
+                    }
+                } else {
+                    executeStructuredAction(
+                        GokuAction(GokuActionType.OPEN_APP, target = habit.displayLabel),
+                        speakResult = true
+                    )
+                }
+            }
+
+            HabitActionType.VOICE_COMMAND -> {
+                handleUserInput(habit.displayLabel, fromVoice = false)
+            }
+        }
+    }
+
+    fun ignorePredictedHabit(habit: PredictedHabitSuggestion) {
+        habitPredictor.dismissSuggestion(habit.id)
+        showBanner("Theek hai, '${habit.displayLabel}' suggestion 4 ghante ke liye snooze kar diya.")
+    }
+
+    fun clearHabits() {
+        viewModelScope.launch {
+            habitPredictor.clearAllHabits()
+            showBanner("Habit history clear kar di gayi.")
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 7: Evolving Skills, Smart Teach-by-Example, Logcat Doctor, Dream Mode & Backup
+    // -------------------------------------------------------------------------
+
+    fun startTeachMode(hintName: String = "") {
+        closeSettings()
+        teachRecorder.startRecording(hintName)
+        val msg = "Theek hai! Teach Mode ON hai. Aap apna kaam karke dikhayein, poora hone par 'Seekh liya' bolein ya DONE dabayein."
+        appendMessage(ChatSender.GOKU, msg)
+        showBanner("Teach-by-Example recording ON…")
+        voiceManager.speakHindi(msg, reopenMicAfterSpeaking = false)
+    }
+
+    fun finishTeachMode(customName: String = "") {
+        viewModelScope.launch {
+            val result = teachRecorder.finishAndSaveSkill(customName)
+            result.onSuccess { (skill, cleaned) ->
+                val msg = "Seekh liya! '${skill.name}' (${skill.mode}, Score ${skill.evolutionScore}/100) save ho gaya — ${cleaned.removedWasteCount} waste steps hata diye gaye."
+                appendMessage(ChatSender.GOKU, msg)
+                showBanner(msg)
+                voiceManager.speakHindi(msg, reopenMicAfterSpeaking = false)
+            }.onFailure { err ->
+                val msg = err.message ?: "Teach Mode mein koi step record nahi ho paya."
+                appendMessage(ChatSender.SYSTEM, msg, isAlert = true)
+                showBanner(msg)
+            }
+        }
+    }
+
+    fun cancelTeachMode() {
+        teachRecorder.cancelRecording("User cancelled")
+        showBanner("Teach-by-Example cancel kar diya gaya.")
+    }
+
+    fun runLearnedSkill(skill: SkillEntity) {
+        closeSettings()
+        activeSkillJob?.cancel()
+        activeSkillJob = viewModelScope.launch {
+            val report = skillEngine.runSkill(
+                skill = skill,
+                allowSelfHeal = true,
+                allowVisionFallback = securePrefs.isScreenVisionFallbackEnabled()
+            )
+            appendMessage(ChatSender.GOKU, report.summaryHindi, isAlert = !report.success)
+            showBanner(report.summaryHindi)
+            voiceManager.speakHindi(report.summaryHindi, reopenMicAfterSpeaking = false)
+
+            val actionKey = "skill:${skill.id}"
+            if (report.success) {
+                logcatDoctor.recordSuccess(actionKey)
+            } else if (logcatDoctor.recordFailureAndShouldDiagnose(actionKey)) {
+                runLogcatSelfDiagnosis(
+                    contextLabel = "Skill '${skill.name}' repeated failure",
+                    lastErrorDetail = report.failureReason
+                )
+            }
+        }
+    }
+
+    fun synthesizeNewSkill(goal: String) {
+        closeSettings()
+        activeSkillJob?.cancel()
+        activeSkillJob = viewModelScope.launch {
+            val result = skillEngine.synthesizeAndSaveSkill(userGoal = goal, executeImmediately = true)
+            result.onSuccess { report ->
+                appendMessage(ChatSender.GOKU, report.summaryHindi, isAlert = !report.success)
+                showBanner(report.summaryHindi)
+                voiceManager.speakHindi(report.summaryHindi, reopenMicAfterSpeaking = false)
+            }.onFailure { err ->
+                val msg = err.message ?: "Naya skill synthesize nahi ho paya."
+                appendMessage(ChatSender.SYSTEM, msg, isAlert = true)
+                showBanner(msg)
+            }
+        }
+    }
+
+    fun saveEditedSkill(skill: SkillEntity) {
+        viewModelScope.launch {
+            val saved = skillEngine.saveOrUpdateManualSkill(skill)
+            showBanner("Skill '${saved.name}' (${saved.mode}) update ho gaya.")
+        }
+    }
+
+    fun deleteSkill(skillId: Long) {
+        viewModelScope.launch {
+            skillEngine.deleteSkill(skillId)
+            showBanner("Skill delete kar diya gaya.")
+        }
+    }
+
+    fun stopSkillEngine() {
+        activeSkillJob?.cancel()
+        activeSkillJob = null
+        skillEngine.cancel("User tapped STOP")
+        showBanner("Skill execution rok diya gaya.")
+    }
+
+    fun runLogcatSelfDiagnosis(
+        contextLabel: String = "Manual Logcat Self-Diagnosis",
+        lastErrorDetail: String = ""
+    ) {
+        viewModelScope.launch {
+            val report = logcatDoctor.runSelfDiagnosis(contextLabel, lastErrorDetail)
+            val msg = "[Logcat Doctor • ${report.category.badge}] Cause: ${report.rootCauseHindi} Fix: ${report.suggestedFixHindi}"
+            appendMessage(ChatSender.SYSTEM, msg, isAlert = report.category.name != "HEALTHY")
+            showBanner(report.rootCauseHindi)
+            voiceManager.speakHindi("${report.rootCauseHindi} ${report.suggestedFixHindi}", reopenMicAfterSpeaking = false)
+        }
+    }
+
+    fun toggleDreamMode(enabled: Boolean) {
+        securePrefs.setDreamModeEnabled(enabled)
+        if (enabled) {
+            DreamModeScheduler.scheduleOvernight(appContext)
+            showBanner("Dream Mode ON — Charging + Wi-Fi par raat ko skills auto-optimize honge.")
+        } else {
+            DreamModeScheduler.cancelOvernight(appContext)
+            showBanner("Dream Mode OFF kar diya gaya.")
+        }
+    }
+
+    fun runDreamModeNow() {
+        DreamModeScheduler.triggerImmediateDream(appContext)
+        showBanner("Dream Mode immediate optimization background mein shuru ho gaya!")
+    }
+
+    fun prepareBackupPassphrase(passphrase: String) {
+        pendingBackupPassphrase = passphrase.trim()
+    }
+
+    fun exportEncryptedBackupToUri(uri: Uri) {
+        val passphrase = pendingBackupPassphrase
+        pendingBackupPassphrase = ""
+        viewModelScope.launch {
+            _isBackupBusy.value = true
+            val res = brainBackupManager.exportToUri(uri, passphrase)
+            _isBackupBusy.value = false
+            res.onSuccess { report ->
+                appendMessage(ChatSender.GOKU, report.detailHindi)
+                showBanner(report.detailHindi)
+                voiceManager.speakHindi(report.detailHindi, reopenMicAfterSpeaking = false)
+            }.onFailure { err ->
+                val msg = err.message ?: "Encrypted backup export fail hua."
+                appendMessage(ChatSender.SYSTEM, msg, isAlert = true)
+                showBanner(msg)
+            }
+        }
+    }
+
+    fun restoreEncryptedBackupFromUri(uri: Uri) {
+        val passphrase = pendingBackupPassphrase
+        pendingBackupPassphrase = ""
+        viewModelScope.launch {
+            _isBackupBusy.value = true
+            val res = brainBackupManager.restoreFromUri(uri, passphrase)
+            _isBackupBusy.value = false
+            res.onSuccess { report ->
+                appendMessage(ChatSender.GOKU, report.detailHindi)
+                showBanner(report.detailHindi)
+                voiceManager.speakHindi(report.detailHindi, reopenMicAfterSpeaking = false)
+            }.onFailure { err ->
+                val msg = err.message ?: "Encrypted backup restore fail hua (passphrase check karein)."
+                appendMessage(ChatSender.SYSTEM, msg, isAlert = true)
+                showBanner(msg)
+            }
+        }
+    }
+
+    fun syncBackupToGitHubGist(passphrase: String) {
+        viewModelScope.launch {
+            _isBackupBusy.value = true
+            val res = brainBackupManager.syncToPrivateGitHubGist(passphrase)
+            _isBackupBusy.value = false
+            res.onSuccess { report ->
+                appendMessage(ChatSender.GOKU, report.detailHindi)
+                showBanner(report.detailHindi)
+            }.onFailure { err ->
+                val msg = err.message ?: "GitHub Gist sync fail hua."
+                appendMessage(ChatSender.SYSTEM, msg, isAlert = true)
+                showBanner(msg)
+            }
+        }
+    }
+
+    fun restoreBackupFromGitHubGist(passphrase: String) {
+        viewModelScope.launch {
+            _isBackupBusy.value = true
+            val res = brainBackupManager.restoreFromPrivateGitHubGist(passphrase)
+            _isBackupBusy.value = false
+            res.onSuccess { report ->
+                appendMessage(ChatSender.GOKU, report.detailHindi)
+                showBanner(report.detailHindi)
+            }.onFailure { err ->
+                val msg = err.message ?: "GitHub Gist restore fail hua."
+                appendMessage(ChatSender.SYSTEM, msg, isAlert = true)
+                showBanner(msg)
+            }
+        }
+    }
+
+    private fun isStartTeachCommand(lower: String): Boolean {
+        return lower.contains("seekh lo") ||
+            lower.contains("sikh lo") ||
+            lower.contains("woh seekh") ||
+            lower.contains("सीख लो") ||
+            lower.contains("teach mode start") ||
+            lower.contains("teach by example")
+    }
+
+    private fun isFinishTeachCommand(lower: String): Boolean {
+        return lower.contains("seekh liya") ||
+            lower.contains("sikh liya") ||
+            lower.contains("सीख लिया") ||
+            lower.contains("teach done") ||
+            lower.contains("recording band")
+    }
+
+    private fun extractTeachHint(raw: String): String {
+        val cleaned = raw.replace(
+            Regex("(?i)(?:hey\\s+)?goku[,\\s]*|main jo kar raha hoon|woh seekh lo|seekh lo|teach mode start"),
+            ""
+        ).trim()
+        return if (cleaned.length in 3..42) cleaned else ""
+    }
+
     fun clearConversation() {
         geminiClient.clearHistory()
         viewModelScope.launch {
@@ -1387,8 +1994,11 @@ class GokuDashboardViewModel(application: Application) : AndroidViewModel(applic
     override fun onCleared() {
         activeChatJob?.cancel()
         activePilotJob?.cancel()
+        activeSkillJob?.cancel()
         universalPilot.cancel("App closed")
+        skillEngine.cancel("App closed")
         backgroundQueue.cancelAllActive()
+        smartCallManager.cancelEmergencyStop("App closed")
         geminiClient.cancelActiveRequest()
         localAdbManager.stopMdnsDiscovery()
         offlineLlmEngine.cancelDownload()

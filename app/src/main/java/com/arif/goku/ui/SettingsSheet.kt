@@ -83,16 +83,24 @@ import com.arif.goku.adb.LocalAdbState
 import com.arif.goku.adb.LocalAdbStatus
 import com.arif.goku.brain.OfflineLlmStage
 import com.arif.goku.brain.OfflineLlmState
+import com.arif.goku.calls.SmartCallPhase
+import com.arif.goku.calls.SmartCallUiState
 import com.arif.goku.data.GokuUserSettings
 import com.arif.goku.data.SecurePrefs
+import com.arif.goku.data.db.CallSummaryEntity
 import com.arif.goku.data.db.MemoryCategory
 import com.arif.goku.data.db.MemoryEntity
+import com.arif.goku.data.db.SkillEntity
 import com.arif.goku.dev.GitHubBuildReport
+import com.arif.goku.habits.PredictedHabitSuggestion
 import com.arif.goku.pilot.PilotState
 import com.arif.goku.safety.BlockedMistakeRecord
+import com.arif.goku.skills.SkillEngineUiState
+import com.arif.goku.skills.TeachSessionState
 import com.arif.goku.system.FocusShieldState
 import com.arif.goku.system.FreezableAppInfo
 import com.arif.goku.system.GhostSettingType
+import com.arif.goku.system.LogcatDiagnosisReport
 import com.arif.goku.system.PhoneDoctorReport
 import com.arif.goku.system.SmartContextState
 import com.arif.goku.voice.KwsModelState
@@ -135,6 +143,15 @@ fun SettingsSheet(
     blockedMistakeCount: Int,
     blockedMistakeRecords: List<BlockedMistakeRecord>,
     backgroundTasks: List<BackgroundTaskItem>,
+    smartCallState: SmartCallUiState,
+    callSummaries: List<CallSummaryEntity>,
+    predictedHabits: List<PredictedHabitSuggestion>,
+    skills: List<SkillEntity>,
+    skillEngineState: SkillEngineUiState,
+    teachState: TeachSessionState,
+    logcatReport: LogcatDiagnosisReport?,
+    isDiagnosingLogcat: Boolean,
+    isBackupBusy: Boolean,
     onSelectTab: (SettingsTab) -> Unit,
     onDismiss: () -> Unit,
     onSaveApiKey: (String) -> Unit,
@@ -147,6 +164,21 @@ fun SettingsSheet(
     onDeleteLocalLlm: () -> Unit,
     onToggleContinuous: (Boolean) -> Unit,
     onTestHindiVoice: () -> Unit,
+    onStartTeachMode: (String) -> Unit,
+    onFinishTeachMode: () -> Unit,
+    onCancelTeachMode: () -> Unit,
+    onSynthesizeSkill: (String) -> Unit,
+    onRunSkill: (SkillEntity) -> Unit,
+    onSaveEditedSkill: (SkillEntity) -> Unit,
+    onDeleteSkill: (Long) -> Unit,
+    onStopSkillEngine: () -> Unit,
+    onRunLogcatDoctor: () -> Unit,
+    onToggleDreamMode: (Boolean) -> Unit,
+    onRunDreamModeNow: () -> Unit,
+    onExportEncryptedBackup: (String) -> Unit,
+    onRestoreEncryptedBackup: (String) -> Unit,
+    onSyncBackupToGist: (String) -> Unit,
+    onRestoreBackupFromGist: (String) -> Unit,
     onToggleUniversalPilot: (Boolean) -> Unit,
     onToggleScreenVision: (Boolean) -> Unit,
     onStartPilotGoal: (String) -> Unit,
@@ -159,6 +191,20 @@ fun SettingsSheet(
     onEnqueueBackgroundTask: (BackgroundTaskType, String) -> Unit,
     onCancelBackgroundTask: (String) -> Unit,
     onClearFinishedBackgroundTasks: () -> Unit,
+    onToggleSmartCall: (Boolean) -> Unit,
+    onSetSmartCallDelay: (Int) -> Unit,
+    onToggleSmartCallSpamAlert: (Boolean) -> Unit,
+    onSaveSmartCallOwnerName: (String) -> Unit,
+    onRequestPhonePermissions: () -> Unit,
+    onRequestDefaultDialerRole: () -> Unit,
+    onStartSmartCallTestTimer: () -> Unit,
+    onCancelSmartCall: () -> Unit,
+    onDeleteCallSummary: (Long) -> Unit,
+    onToggleHabitPredictor: (Boolean) -> Unit,
+    onRefreshHabitPredictions: () -> Unit,
+    onRunPredictedHabit: (PredictedHabitSuggestion) -> Unit,
+    onIgnorePredictedHabit: (PredictedHabitSuggestion) -> Unit,
+    onClearHabits: () -> Unit,
     onAddMemory: (MemoryCategory, String, String) -> Unit,
     onUpdateMemory: (MemoryEntity) -> Unit,
     onDeleteMemory: (Long) -> Unit,
@@ -228,6 +274,17 @@ fun SettingsSheet(
                     text = { Text("Brain", style = MaterialTheme.typography.labelLarge) },
                     modifier = Modifier.testTag("settings_tab_brain")
                 )
+                Tab(
+                    selected = uiState.activeSettingsTab == SettingsTab.SKILLS_BACKUP,
+                    onClick = { onSelectTab(SettingsTab.SKILLS_BACKUP) },
+                    text = {
+                        Text(
+                            text = if (skills.isNotEmpty()) "Skills & Backup (${skills.size})" else "Skills & Backup",
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    },
+                    modifier = Modifier.testTag("settings_tab_skills_backup")
+                )
                 val activeBgCount = backgroundTasks.count {
                     it.status == BackgroundTaskStatus.QUEUED || it.status == BackgroundTaskStatus.RUNNING
                 }
@@ -241,6 +298,22 @@ fun SettingsSheet(
                         )
                     },
                     modifier = Modifier.testTag("settings_tab_pilot_queue")
+                )
+                val callsBadge = when {
+                    smartCallState.phase == SmartCallPhase.RINGING_COUNTDOWN -> " (${smartCallState.countdownSecondsLeft}s)"
+                    callSummaries.isNotEmpty() -> " (${callSummaries.size})"
+                    else -> ""
+                }
+                Tab(
+                    selected = uiState.activeSettingsTab == SettingsTab.CALLS_HABITS,
+                    onClick = { onSelectTab(SettingsTab.CALLS_HABITS) },
+                    text = {
+                        Text(
+                            text = "Calls & Habits$callsBadge",
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    },
+                    modifier = Modifier.testTag("settings_tab_calls_habits")
                 )
                 Tab(
                     selected = uiState.activeSettingsTab == SettingsTab.MEMORY,
@@ -305,6 +378,31 @@ fun SettingsSheet(
                         onTestHindiVoice = onTestHindiVoice
                     )
 
+                    SettingsTab.SKILLS_BACKUP -> SkillsAndBackupSettingsSection(
+                        userSettings = userSettings,
+                        skills = skills,
+                        skillEngineState = skillEngineState,
+                        teachState = teachState,
+                        logcatReport = logcatReport,
+                        isDiagnosingLogcat = isDiagnosingLogcat,
+                        isBackupBusy = isBackupBusy,
+                        onStartTeachMode = onStartTeachMode,
+                        onFinishTeachMode = onFinishTeachMode,
+                        onCancelTeachMode = onCancelTeachMode,
+                        onSynthesizeSkill = onSynthesizeSkill,
+                        onRunSkill = onRunSkill,
+                        onSaveEditedSkill = onSaveEditedSkill,
+                        onDeleteSkill = onDeleteSkill,
+                        onStopSkillEngine = onStopSkillEngine,
+                        onRunLogcatDoctor = onRunLogcatDoctor,
+                        onToggleDreamMode = onToggleDreamMode,
+                        onRunDreamModeNow = onRunDreamModeNow,
+                        onExportEncryptedBackup = onExportEncryptedBackup,
+                        onRestoreEncryptedBackup = onRestoreEncryptedBackup,
+                        onSyncBackupToGist = onSyncBackupToGist,
+                        onRestoreBackupFromGist = onRestoreBackupFromGist
+                    )
+
                     SettingsTab.PILOT_QUEUE -> PilotAndQueueSettingsSection(
                         userSettings = userSettings,
                         pilotState = pilotState,
@@ -323,6 +421,28 @@ fun SettingsSheet(
                         onEnqueueBackgroundTask = onEnqueueBackgroundTask,
                         onCancelBackgroundTask = onCancelBackgroundTask,
                         onClearFinishedBackgroundTasks = onClearFinishedBackgroundTasks
+                    )
+
+                    SettingsTab.CALLS_HABITS -> CallsAndHabitsSettingsSection(
+                        uiState = uiState,
+                        userSettings = userSettings,
+                        smartCallState = smartCallState,
+                        callSummaries = callSummaries,
+                        predictedHabits = predictedHabits,
+                        onToggleSmartCall = onToggleSmartCall,
+                        onSetSmartCallDelay = onSetSmartCallDelay,
+                        onToggleSpamAlert = onToggleSmartCallSpamAlert,
+                        onSaveOwnerName = onSaveSmartCallOwnerName,
+                        onRequestPhonePermissions = onRequestPhonePermissions,
+                        onRequestDefaultDialerRole = onRequestDefaultDialerRole,
+                        onStartSmartCallTestTimer = onStartSmartCallTestTimer,
+                        onCancelSmartCall = onCancelSmartCall,
+                        onDeleteCallSummary = onDeleteCallSummary,
+                        onToggleHabitPredictor = onToggleHabitPredictor,
+                        onRefreshHabitPredictions = onRefreshHabitPredictions,
+                        onRunPredictedHabit = onRunPredictedHabit,
+                        onIgnorePredictedHabit = onIgnorePredictedHabit,
+                        onClearHabits = onClearHabits
                     )
 
                     SettingsTab.MEMORY -> MemoryVaultSettingsSection(

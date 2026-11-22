@@ -35,7 +35,11 @@ data class AccessibilityScreenSignal(
     val clickedOrFocusedText: String,
     val visibleTexts: List<String>,
     val clickableItems: List<String>,
-    val timestampMs: Long = System.currentTimeMillis()
+    val timestampMs: Long = System.currentTimeMillis(),
+    val viewId: String = "",
+    val typedText: String = "",
+    val centerX: Int? = null,
+    val centerY: Int? = null
 )
 
 data class UiNodeSnapshot(
@@ -92,13 +96,38 @@ class GokuAccessibilityService : AccessibilityService() {
             _currentForegroundPackage.value = pkg
         }
 
-        // Phase 5 Live Mistake Blocker real-time event hook (throttled for content updates, immediate for clicks)
+        // Phase 5 Live Mistake Blocker + Phase 7 Teach-by-Example real-time event hook
         val eventType = event.eventType
         val isHighPriority = eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
-            eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED
         val now = System.currentTimeMillis()
         if (!isHighPriority && now - lastSignalEmitMs < 900L) return
+        if (eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED && now - lastSignalEmitMs < 600L) return
         lastSignalEmitMs = now
+
+        val sourceNode = event.source
+        val viewId = runCatching { sourceNode?.viewIdResourceName.orEmpty() }.getOrDefault("")
+        val boundsRect = Rect()
+        var cx: Int? = null
+        var cy: Int? = null
+        if (sourceNode != null) {
+            runCatching {
+                sourceNode.getBoundsInScreen(boundsRect)
+                if (boundsRect.width() > 0 && boundsRect.height() > 0) {
+                    cx = boundsRect.centerX()
+                    cy = boundsRect.centerY()
+                }
+            }
+        }
+
+        val typedText = if (eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
+            event.text?.joinToString(" ") { it?.toString().orEmpty() }?.trim().orEmpty()
+                .ifBlank { sourceNode?.text?.toString()?.trim().orEmpty() }
+        } else {
+            ""
+        }
 
         val eventTexts = buildList {
             event.text?.forEach { cs ->
@@ -106,7 +135,7 @@ class GokuAccessibilityService : AccessibilityService() {
                 if (s.isNotBlank()) add(s)
             }
             event.contentDescription?.toString()?.trim()?.takeIf { it.isNotBlank() }?.let { add(it) }
-            event.source?.let { src ->
+            sourceNode?.let { src ->
                 val srcLabel = extractNodeLabel(src)
                 if (srcLabel.isNotBlank()) add(srcLabel)
             }
@@ -125,7 +154,11 @@ class GokuAccessibilityService : AccessibilityService() {
                 clickedOrFocusedText = eventTexts,
                 visibleTexts = summary?.visibleTexts.orEmpty().take(24),
                 clickableItems = summary?.clickableItems.orEmpty().take(18),
-                timestampMs = now
+                timestampMs = now,
+                viewId = viewId,
+                typedText = typedText.take(200),
+                centerX = cx,
+                centerY = cy
             )
         )
     }

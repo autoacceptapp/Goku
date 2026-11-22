@@ -35,7 +35,19 @@ data class GokuUserSettings(
     val universalPilotEnabled: Boolean = true,
     val screenVisionFallbackEnabled: Boolean = true,
     val mistakeBlockerEnabled: Boolean = true,
-    val zeroCopyBridgeEnabled: Boolean = true
+    val zeroCopyBridgeEnabled: Boolean = true,
+    // Phase 6 settings
+    val smartCallEnabled: Boolean = false,
+    val smartCallDelaySeconds: Int = SecurePrefs.DEFAULT_SMART_CALL_DELAY_SECONDS,
+    val smartCallSpamAlertEnabled: Boolean = true,
+    val smartCallOwnerName: String = SecurePrefs.DEFAULT_OWNER_NAME,
+    val habitPredictorEnabled: Boolean = true,
+    // Phase 7 settings
+    val dreamModeEnabled: Boolean = false,
+    val lastDreamSummary: String = "",
+    val lastDreamTimestampMs: Long = 0L,
+    val backupGistId: String = "",
+    val lastBackupSummary: String = ""
 )
 
 /**
@@ -266,6 +278,85 @@ class SecurePrefs(context: Context) {
         refreshSnapshot()
     }
 
+    // --- Phase 6 Preferences (Smart Call 30s Auto-Answer & Habit Predictor) ---
+
+    fun isSmartCallEnabled(): Boolean = prefs.getBoolean(KEY_SMART_CALL_ENABLED, false)
+
+    fun setSmartCallEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_SMART_CALL_ENABLED, enabled).apply()
+        refreshSnapshot()
+    }
+
+    fun getSmartCallDelaySeconds(): Int =
+        prefs.getInt(KEY_SMART_CALL_DELAY_SECONDS, DEFAULT_SMART_CALL_DELAY_SECONDS).coerceIn(5, 60)
+
+    fun setSmartCallDelaySeconds(seconds: Int) {
+        prefs.edit().putInt(KEY_SMART_CALL_DELAY_SECONDS, seconds.coerceIn(5, 60)).apply()
+        refreshSnapshot()
+    }
+
+    fun isSmartCallSpamAlertEnabled(): Boolean =
+        prefs.getBoolean(KEY_SMART_CALL_SPAM_ALERT, true)
+
+    fun setSmartCallSpamAlertEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_SMART_CALL_SPAM_ALERT, enabled).apply()
+        refreshSnapshot()
+    }
+
+    fun getSmartCallOwnerName(): String =
+        prefs.getString(KEY_SMART_CALL_OWNER_NAME, DEFAULT_OWNER_NAME).orEmpty()
+            .trim()
+            .ifBlank { DEFAULT_OWNER_NAME }
+
+    fun setSmartCallOwnerName(name: String) {
+        val cleaned = name.trim().ifBlank { DEFAULT_OWNER_NAME }
+        prefs.edit().putString(KEY_SMART_CALL_OWNER_NAME, cleaned).apply()
+        refreshSnapshot()
+    }
+
+    fun isHabitPredictorEnabled(): Boolean =
+        prefs.getBoolean(KEY_HABIT_PREDICTOR_ENABLED, true)
+
+    fun setHabitPredictorEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_HABIT_PREDICTOR_ENABLED, enabled).apply()
+        refreshSnapshot()
+    }
+
+    // --- Phase 7 Preferences (Dream Mode & Encrypted Brain Backup) ---
+
+    fun isDreamModeEnabled(): Boolean = prefs.getBoolean(KEY_DREAM_MODE_ENABLED, false)
+
+    fun setDreamModeEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_DREAM_MODE_ENABLED, enabled).apply()
+        refreshSnapshot()
+    }
+
+    fun getLastDreamSummary(): String = prefs.getString(KEY_LAST_DREAM_SUMMARY, "").orEmpty()
+
+    fun getLastDreamTimestampMs(): Long = prefs.getLong(KEY_LAST_DREAM_TIMESTAMP, 0L)
+
+    fun saveLastDreamReport(summary: String, timestampMs: Long = System.currentTimeMillis()) {
+        prefs.edit()
+            .putString(KEY_LAST_DREAM_SUMMARY, summary.trim())
+            .putLong(KEY_LAST_DREAM_TIMESTAMP, timestampMs)
+            .apply()
+        refreshSnapshot()
+    }
+
+    fun getBackupGistId(): String = prefs.getString(KEY_BACKUP_GIST_ID, "").orEmpty().trim()
+
+    fun saveBackupGistId(gistId: String) {
+        prefs.edit().putString(KEY_BACKUP_GIST_ID, gistId.trim()).apply()
+        refreshSnapshot()
+    }
+
+    fun getLastBackupSummary(): String = prefs.getString(KEY_LAST_BACKUP_SUMMARY, "").orEmpty()
+
+    fun saveLastBackupSummary(summary: String) {
+        prefs.edit().putString(KEY_LAST_BACKUP_SUMMARY, summary.trim()).apply()
+        refreshSnapshot()
+    }
+
     private fun refreshSnapshot() {
         _settingsFlow.value = readSnapshot()
     }
@@ -297,7 +388,17 @@ class SecurePrefs(context: Context) {
             universalPilotEnabled = isUniversalPilotEnabled(),
             screenVisionFallbackEnabled = isScreenVisionFallbackEnabled(),
             mistakeBlockerEnabled = isMistakeBlockerEnabled(),
-            zeroCopyBridgeEnabled = isZeroCopyBridgeEnabled()
+            zeroCopyBridgeEnabled = isZeroCopyBridgeEnabled(),
+            smartCallEnabled = isSmartCallEnabled(),
+            smartCallDelaySeconds = getSmartCallDelaySeconds(),
+            smartCallSpamAlertEnabled = isSmartCallSpamAlertEnabled(),
+            smartCallOwnerName = getSmartCallOwnerName(),
+            habitPredictorEnabled = isHabitPredictorEnabled(),
+            dreamModeEnabled = isDreamModeEnabled(),
+            lastDreamSummary = getLastDreamSummary(),
+            lastDreamTimestampMs = getLastDreamTimestampMs(),
+            backupGistId = getBackupGistId(),
+            lastBackupSummary = getLastBackupSummary()
         )
     }
 
@@ -323,6 +424,19 @@ class SecurePrefs(context: Context) {
         private const val KEY_SCREEN_VISION_FALLBACK = "phase5_screen_vision_fallback_enabled"
         private const val KEY_MISTAKE_BLOCKER = "phase5_mistake_blocker_enabled"
         private const val KEY_ZERO_COPY_BRIDGE = "phase5_zero_copy_bridge_enabled"
+        private const val KEY_SMART_CALL_ENABLED = "phase6_smart_call_enabled"
+        private const val KEY_SMART_CALL_DELAY_SECONDS = "phase6_smart_call_delay_seconds"
+        private const val KEY_SMART_CALL_SPAM_ALERT = "phase6_smart_call_spam_alert"
+        private const val KEY_SMART_CALL_OWNER_NAME = "phase6_smart_call_owner_name"
+        private const val KEY_HABIT_PREDICTOR_ENABLED = "phase6_habit_predictor_enabled"
+        private const val KEY_DREAM_MODE_ENABLED = "phase7_dream_mode_enabled"
+        private const val KEY_LAST_DREAM_SUMMARY = "phase7_last_dream_summary"
+        private const val KEY_LAST_DREAM_TIMESTAMP = "phase7_last_dream_timestamp"
+        private const val KEY_BACKUP_GIST_ID = "phase7_backup_gist_id"
+        private const val KEY_LAST_BACKUP_SUMMARY = "phase7_last_backup_summary"
+
+        const val DEFAULT_SMART_CALL_DELAY_SECONDS = 30
+        const val DEFAULT_OWNER_NAME = "Arif"
 
         val DEFAULT_GITHUB_REPOS = listOf(
             "autoacceptapp/goku_agent",

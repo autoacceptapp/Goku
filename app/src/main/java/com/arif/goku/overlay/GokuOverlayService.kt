@@ -47,7 +47,8 @@ enum class OverlayOrbState(val label: String, val glowHex: Int) {
 
 enum class OverlayCommand {
     TAP_ORB,
-    EMERGENCY_STOP
+    EMERGENCY_STOP,
+    TOGGLE_TEACH
 }
 
 data class MistakeOverlayAlert(
@@ -62,9 +63,22 @@ data class OverlayMistakeDecision(
     val allowOnce: Boolean
 )
 
+data class OverlayHabitSuggestion(
+    val id: String,
+    val displayLabel: String,
+    val promptHindi: String,
+    val actionType: String,
+    val target: String
+)
+
+data class OverlayHabitDecision(
+    val suggestionId: String,
+    val runNow: Boolean
+)
+
 /**
  * Shared reactive bridge between GokuDashboardViewModel, Mistake Blocker, Background Queue,
- * and GokuOverlayService.
+ * Habit Predictor, and GokuOverlayService.
  */
 object OverlayBridge {
     private val _isOverlayRunning = MutableStateFlow(false)
@@ -76,14 +90,23 @@ object OverlayBridge {
     private val _queueProgressLabel = MutableStateFlow("")
     val queueProgressLabel: StateFlow<String> = _queueProgressLabel.asStateFlow()
 
+    private val _isTeaching = MutableStateFlow(false)
+    val isTeaching: StateFlow<Boolean> = _isTeaching.asStateFlow()
+
     private val _activeMistakeAlert = MutableStateFlow<MistakeOverlayAlert?>(null)
     val activeMistakeAlert: StateFlow<MistakeOverlayAlert?> = _activeMistakeAlert.asStateFlow()
+
+    private val _activeHabitSuggestion = MutableStateFlow<OverlayHabitSuggestion?>(null)
+    val activeHabitSuggestion: StateFlow<OverlayHabitSuggestion?> = _activeHabitSuggestion.asStateFlow()
 
     private val _commands = MutableSharedFlow<OverlayCommand>(extraBufferCapacity = 8)
     val commands: SharedFlow<OverlayCommand> = _commands.asSharedFlow()
 
     private val _mistakeDecisions = MutableSharedFlow<OverlayMistakeDecision>(extraBufferCapacity = 8)
     val mistakeDecisions: SharedFlow<OverlayMistakeDecision> = _mistakeDecisions.asSharedFlow()
+
+    private val _habitDecisions = MutableSharedFlow<OverlayHabitDecision>(extraBufferCapacity = 8)
+    val habitDecisions: SharedFlow<OverlayHabitDecision> = _habitDecisions.asSharedFlow()
 
     fun setRunning(running: Boolean) {
         _isOverlayRunning.value = running
@@ -97,6 +120,10 @@ object OverlayBridge {
         _queueProgressLabel.value = label.trim()
     }
 
+    fun setTeaching(teaching: Boolean) {
+        _isTeaching.value = teaching
+    }
+
     fun showMistakeWarning(alert: MistakeOverlayAlert) {
         _activeMistakeAlert.value = alert
     }
@@ -108,6 +135,19 @@ object OverlayBridge {
     fun emitMistakeDecision(signature: String, allowOnce: Boolean) {
         _activeMistakeAlert.value = null
         _mistakeDecisions.tryEmit(OverlayMistakeDecision(signature = signature, allowOnce = allowOnce))
+    }
+
+    fun showHabitSuggestion(suggestion: OverlayHabitSuggestion) {
+        _activeHabitSuggestion.value = suggestion
+    }
+
+    fun dismissHabitSuggestion() {
+        _activeHabitSuggestion.value = null
+    }
+
+    fun emitHabitDecision(suggestionId: String, runNow: Boolean) {
+        _activeHabitSuggestion.value = null
+        _habitDecisions.tryEmit(OverlayHabitDecision(suggestionId = suggestionId, runNow = runNow))
     }
 
     fun emitCommand(cmd: OverlayCommand) {
@@ -128,8 +168,11 @@ class GokuOverlayService : Service() {
     private var overlayContainer: LinearLayout? = null
     private var orbLabelView: TextView? = null
     private var orbBgDrawable: GradientDrawable? = null
+    private var teachButtonView: TextView? = null
+    private var teachBgDrawable: GradientDrawable? = null
     private var queueBadgeView: TextView? = null
     private var mistakeAlertView: LinearLayout? = null
+    private var habitSuggestionView: LinearLayout? = null
     private var observersStarted = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -180,6 +223,16 @@ class GokuOverlayService : Service() {
             serviceScope.launch {
                 OverlayBridge.activeMistakeAlert.collect { alert ->
                     renderMistakeWarningOverlay(alert)
+                }
+            }
+            serviceScope.launch {
+                OverlayBridge.activeHabitSuggestion.collect { suggestion ->
+                    renderHabitSuggestionOverlay(suggestion)
+                }
+            }
+            serviceScope.launch {
+                OverlayBridge.isTeaching.collect { teaching ->
+                    updateTeachButtonVisual(teaching)
                 }
             }
         }
@@ -307,6 +360,35 @@ class GokuOverlayService : Service() {
             }
         }
 
+        // Phase 7 Teach-by-Example 1-tap TEACH / DONE pill below STOP
+        val teachBg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(12).toFloat()
+            setColor(Color.parseColor("#E60F172A"))
+            setStroke(dp(1), Color.parseColor("#00E5FF"))
+        }
+        teachBgDrawable = teachBg
+
+        val teachButton = TextView(this).apply {
+            text = "TEACH"
+            setTextColor(Color.parseColor("#00E5FF"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
+            gravity = Gravity.CENTER
+            background = teachBg
+            setPadding(dp(9), dp(4), dp(9), dp(4))
+            contentDescription = "Toggle Goku Teach-by-Example skill recorder"
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(4)
+            }
+            setOnClickListener {
+                OverlayBridge.emitCommand(OverlayCommand.TOGGLE_TEACH)
+            }
+        }
+        teachButtonView = teachButton
+
         // Phase 5 Background Queue progress pill (shown silently while background tasks run)
         val queueBg = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
@@ -333,6 +415,7 @@ class GokuOverlayService : Service() {
 
         root.addView(orbView)
         root.addView(stopButton)
+        root.addView(teachButton)
         root.addView(queueBadge)
 
         try {
@@ -340,6 +423,22 @@ class GokuOverlayService : Service() {
             overlayContainer = root
         } catch (_: Exception) {
             stopSelf()
+        }
+    }
+
+    private fun updateTeachButtonVisual(isTeaching: Boolean) {
+        teachButtonView?.apply {
+            text = if (isTeaching) "DONE" else "TEACH"
+            setTextColor(if (isTeaching) Color.BLACK else Color.parseColor("#00E5FF"))
+        }
+        teachBgDrawable?.apply {
+            if (isTeaching) {
+                setColor(Color.parseColor("#FFFF9100"))
+                setStroke(dp(1), Color.WHITE)
+            } else {
+                setColor(Color.parseColor("#E60F172A"))
+                setStroke(dp(1), Color.parseColor("#00E5FF"))
+            }
         }
     }
 
@@ -492,6 +591,126 @@ class GokuOverlayService : Service() {
         mistakeAlertView = null
     }
 
+    private fun renderHabitSuggestionOverlay(suggestion: OverlayHabitSuggestion?) {
+        val wm = windowManager ?: return
+        removeHabitSuggestionView(wm)
+        if (suggestion == null) return
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = dp(76)
+        }
+
+        val cardBg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(16).toFloat()
+            setColor(Color.parseColor("#F00A1020"))
+            setStroke(dp(1), Color.parseColor("#00E5FF"))
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardBg
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            elevation = dp(10).toFloat()
+        }
+
+        val titleView = TextView(this).apply {
+            text = "GOKU HABIT PREDICTOR"
+            setTextColor(Color.parseColor("#00E5FF"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        }
+        val promptView = TextView(this).apply {
+            text = suggestion.promptHindi
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(0, dp(4), 0, dp(10))
+        }
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+
+        val ignoreBg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(10).toFloat()
+            setColor(Color.parseColor("#1E293B"))
+        }
+        val ignoreBtn = TextView(this).apply {
+            text = "IGNORE"
+            setTextColor(Color.parseColor("#94A3B8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            background = ignoreBg
+            setPadding(dp(14), dp(9), dp(14), dp(9))
+            setOnClickListener {
+                OverlayBridge.emitHabitDecision(suggestion.id, runNow = false)
+            }
+        }
+
+        val runBg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(10).toFloat()
+            setColor(Color.parseColor("#00E5FF"))
+        }
+        val runBtn = TextView(this).apply {
+            text = "RUN NOW"
+            setTextColor(Color.parseColor("#070B14"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            background = runBg
+            setPadding(dp(16), dp(9), dp(16), dp(9))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginStart = dp(8)
+            }
+            setOnClickListener {
+                OverlayBridge.emitHabitDecision(suggestion.id, runNow = true)
+            }
+        }
+
+        btnRow.addView(ignoreBtn)
+        btnRow.addView(runBtn)
+        container.addView(titleView)
+        container.addView(promptView)
+        container.addView(btnRow)
+
+        val outerWrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(6), dp(18), dp(6))
+            addView(
+                container,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
+
+        try {
+            wm.addView(outerWrapper, params)
+            habitSuggestionView = outerWrapper
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun removeHabitSuggestionView(wm: WindowManager?) {
+        habitSuggestionView?.let { view ->
+            try {
+                wm?.removeView(view)
+            } catch (_: Exception) {
+            }
+        }
+        habitSuggestionView = null
+    }
+
     private fun ensureNotificationChannel() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         val channel = NotificationChannel(
@@ -546,6 +765,7 @@ class GokuOverlayService : Service() {
     override fun onDestroy() {
         serviceScope.cancel()
         removeMistakeOverlayView(windowManager)
+        removeHabitSuggestionView(windowManager)
         overlayContainer?.let { view ->
             try {
                 windowManager?.removeView(view)

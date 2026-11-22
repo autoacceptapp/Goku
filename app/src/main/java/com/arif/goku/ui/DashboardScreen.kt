@@ -42,6 +42,8 @@ import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.PhoneInTalk
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.StopCircle
@@ -75,6 +77,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.ImeAction
@@ -88,6 +91,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.arif.goku.adb.LocalAdbState
 import com.arif.goku.adb.LocalAdbStatus
 import com.arif.goku.brain.ActiveBrainTier
+import com.arif.goku.calls.SmartCallManager
+import com.arif.goku.calls.SmartCallPhase
 import com.arif.goku.safety.PendingSafetyAction
 import com.arif.goku.voice.VoiceEngineState
 import com.arif.goku.worker.BackgroundTaskStatus
@@ -133,7 +138,18 @@ fun DashboardScreen(
     val blockedMistakeRecords by viewModel.blockedMistakeRecords.collectAsStateWithLifecycle()
     val blockedMistakeCount by viewModel.blockedMistakeCount.collectAsStateWithLifecycle()
     val backgroundTasks by viewModel.backgroundTasks.collectAsStateWithLifecycle()
+    val smartCallState by viewModel.smartCallState.collectAsStateWithLifecycle()
+    val callSummaries by viewModel.callSummaries.collectAsStateWithLifecycle()
+    val activeHabitSuggestion by viewModel.activeHabitSuggestion.collectAsStateWithLifecycle()
+    val predictedHabits by viewModel.predictedHabits.collectAsStateWithLifecycle()
+    val skills by viewModel.skills.collectAsStateWithLifecycle()
+    val skillEngineState by viewModel.skillEngineState.collectAsStateWithLifecycle()
+    val teachState by viewModel.teachState.collectAsStateWithLifecycle()
+    val logcatReport by viewModel.logcatReport.collectAsStateWithLifecycle()
+    val isDiagnosingLogcat by viewModel.isDiagnosingLogcat.collectAsStateWithLifecycle()
+    val isBackupBusy by viewModel.isBackupBusy.collectAsStateWithLifecycle()
 
+    val context = LocalContext.current
     var textInput by remember { mutableStateOf("") }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
@@ -148,11 +164,33 @@ fun DashboardScreen(
         viewModel.onMultiplePermissionsResult(results)
     }
 
+    val dialerRoleLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        viewModel.refreshSystemStatuses()
+    }
+
     val localLlmPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
             viewModel.importOfflineLlmModel(uri)
+        }
+    }
+
+    val exportBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        if (uri != null) {
+            viewModel.exportEncryptedBackupToUri(uri)
+        }
+    }
+
+    val restoreBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.restoreEncryptedBackupFromUri(uri)
         }
     }
 
@@ -410,6 +448,259 @@ fun DashboardScreen(
                     }
                 }
 
+                // Phase 7 Live Teach-by-Example Recording Banner
+                AnimatedVisibility(
+                    visible = teachState.isRecording || skillEngineState.isRunning,
+                    enter = fadeIn(),
+                    exit = fadeOut()
+                ) {
+                    Surface(
+                        color = if (teachState.isRecording) CrimsonContainer else GokuAmberContainer,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (teachState.isRecording) CrimsonEmergency else GokuAmber
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .testTag("phase7_teach_or_skill_banner")
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = if (teachState.isRecording) {
+                                        "TEACH MODE REC • ${teachState.recordedEventCount} steps"
+                                    } else {
+                                        "SKILL ENGINE • ${skillEngineState.activeSkillName}"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (teachState.isRecording) CrimsonEmergency else GokuAmber
+                                )
+                                Text(
+                                    text = if (teachState.isRecording) teachState.statusHindi else skillEngineState.statusHindi,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            if (teachState.isRecording) {
+                                Button(
+                                    onClick = { viewModel.finishTeachMode() },
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    modifier = Modifier.testTag("banner_finish_teach_button")
+                                ) {
+                                    Text("SEEKH LIYA", style = MaterialTheme.typography.labelSmall)
+                                }
+                            } else {
+                                OutlinedButton(
+                                    onClick = viewModel::stopSkillEngine,
+                                    border = BorderStroke(1.dp, CrimsonEmergency),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    modifier = Modifier.testTag("banner_stop_skill_button")
+                                ) {
+                                    Text("STOP", style = MaterialTheme.typography.labelSmall, color = CrimsonEmergency)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Phase 6 Live Smart Call Countdown / Predicted Habit / Latest Call Summary Card
+                val isSmartCallActive = smartCallState.phase != SmartCallPhase.IDLE &&
+                    smartCallState.phase != SmartCallPhase.COMPLETED
+                val latestCallSummary = callSummaries.firstOrNull()
+                AnimatedVisibility(
+                    visible = isSmartCallActive || activeHabitSuggestion != null || latestCallSummary != null,
+                    enter = fadeIn(),
+                    exit = fadeOut()
+                ) {
+                    when {
+                        isSmartCallActive -> {
+                            Surface(
+                                color = if (smartCallState.isSpamOrUnknown) CrimsonContainer else GokuAmberContainer,
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (smartCallState.isSpamOrUnknown) CrimsonEmergency else GokuAmber
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                                    .testTag("phase6_smart_call_banner")
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.PhoneInTalk,
+                                            contentDescription = null,
+                                            tint = if (smartCallState.isSpamOrUnknown) CrimsonEmergency else GokuAmber,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column {
+                                            Text(
+                                                text = when (smartCallState.phase) {
+                                                    SmartCallPhase.RINGING_COUNTDOWN ->
+                                                        "SMART CALL • ${smartCallState.countdownSecondsLeft}s left (${smartCallState.callerName})"
+                                                    SmartCallPhase.SPEAKING_GREETING ->
+                                                        "SPEAKERPHONE • Hindi greeting bol raha hoon"
+                                                    SmartCallPhase.LISTENING_CALLER ->
+                                                        "SPEAKERPHONE • Caller ka message sun raha hoon"
+                                                    else -> "SMART CALL ACTIVE"
+                                                },
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (smartCallState.isSpamOrUnknown) CrimsonEmergency else GokuAmber,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                text = smartCallState.spamAlertMessage ?: smartCallState.statusHindi,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    OutlinedButton(
+                                        onClick = viewModel::cancelSmartCall,
+                                        border = BorderStroke(1.dp, CrimsonEmergency),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                        modifier = Modifier.testTag("banner_cancel_smart_call_button")
+                                    ) {
+                                        Text("CANCEL", style = MaterialTheme.typography.labelSmall, color = CrimsonEmergency)
+                                    }
+                                }
+                            }
+                        }
+
+                        activeHabitSuggestion != null -> {
+                            val suggestion = activeHabitSuggestion!!
+                            Surface(
+                                color = ElevatedHudCard,
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, ArcCyan.copy(alpha = 0.6f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                                    .testTag("phase6_habit_banner")
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "HABIT PREDICTOR • ${suggestion.typicalTimeLabel} (${suggestion.matchCount}x)",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = ArcCyan
+                                        )
+                                        Text(
+                                            text = suggestion.promptHindi,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Button(
+                                            onClick = { viewModel.runPredictedHabit(suggestion) },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                            modifier = Modifier.testTag("banner_run_habit_button")
+                                        ) {
+                                            Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp))
+                                            Spacer(modifier = Modifier.width(2.dp))
+                                            Text("RUN", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                        OutlinedButton(
+                                            onClick = { viewModel.ignorePredictedHabit(suggestion) },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                            modifier = Modifier.testTag("banner_ignore_habit_button")
+                                        ) {
+                                            Text("IGNORE", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        latestCallSummary != null -> {
+                            Surface(
+                                color = ElevatedHudCard.copy(alpha = 0.9f),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (latestCallSummary.isSpamOrUnknown) CrimsonEmergency.copy(alpha = 0.55f)
+                                    else EmeraldOnline.copy(alpha = 0.45f)
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                                    .clickable { viewModel.openSettings(SettingsTab.CALLS_HABITS) }
+                                    .testTag("phase6_latest_call_summary_pill")
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.PhoneInTalk,
+                                            contentDescription = null,
+                                            tint = if (latestCallSummary.isSpamOrUnknown) CrimsonEmergency else EmeraldOnline,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "Last Smart Call (${latestCallSummary.callerName}): ${latestCallSummary.summaryHindi}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "CALLS (${callSummaries.size})",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = ArcCyan
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
                 AnimatedVisibility(
                     visible = uiState.transientBanner != null,
                     enter = fadeIn(),
@@ -562,6 +853,15 @@ fun DashboardScreen(
             blockedMistakeCount = blockedMistakeCount,
             blockedMistakeRecords = blockedMistakeRecords,
             backgroundTasks = backgroundTasks,
+            smartCallState = smartCallState,
+            callSummaries = callSummaries,
+            predictedHabits = predictedHabits,
+            skills = skills,
+            skillEngineState = skillEngineState,
+            teachState = teachState,
+            logcatReport = logcatReport,
+            isDiagnosingLogcat = isDiagnosingLogcat,
+            isBackupBusy = isBackupBusy,
             onSelectTab = viewModel::selectSettingsTab,
             onDismiss = viewModel::closeSettings,
             onSaveApiKey = viewModel::saveApiKey,
@@ -574,6 +874,27 @@ fun DashboardScreen(
             onDeleteLocalLlm = viewModel::deleteOfflineLlmModel,
             onToggleContinuous = viewModel::toggleContinuousListening,
             onTestHindiVoice = viewModel::testHindiVoice,
+            onStartTeachMode = viewModel::startTeachMode,
+            onFinishTeachMode = { viewModel.finishTeachMode() },
+            onCancelTeachMode = viewModel::cancelTeachMode,
+            onSynthesizeSkill = viewModel::synthesizeNewSkill,
+            onRunSkill = viewModel::runLearnedSkill,
+            onSaveEditedSkill = viewModel::saveEditedSkill,
+            onDeleteSkill = viewModel::deleteSkill,
+            onStopSkillEngine = viewModel::stopSkillEngine,
+            onRunLogcatDoctor = { viewModel.runLogcatSelfDiagnosis() },
+            onToggleDreamMode = viewModel::toggleDreamMode,
+            onRunDreamModeNow = viewModel::runDreamModeNow,
+            onExportEncryptedBackup = { passphrase ->
+                viewModel.prepareBackupPassphrase(passphrase)
+                exportBackupLauncher.launch("goku_brain_backup.goku")
+            },
+            onRestoreEncryptedBackup = { passphrase ->
+                viewModel.prepareBackupPassphrase(passphrase)
+                restoreBackupLauncher.launch(arrayOf("*/*"))
+            },
+            onSyncBackupToGist = viewModel::syncBackupToGitHubGist,
+            onRestoreBackupFromGist = viewModel::restoreBackupFromGitHubGist,
             onToggleUniversalPilot = viewModel::toggleUniversalPilot,
             onToggleScreenVision = viewModel::toggleScreenVisionFallback,
             onStartPilotGoal = viewModel::startUniversalPilot,
@@ -586,6 +907,38 @@ fun DashboardScreen(
             onEnqueueBackgroundTask = { type, query -> viewModel.enqueueBackgroundTask(type, query) },
             onCancelBackgroundTask = viewModel::cancelBackgroundTask,
             onClearFinishedBackgroundTasks = viewModel::clearFinishedBackgroundTasks,
+            onToggleSmartCall = viewModel::toggleSmartCall,
+            onSetSmartCallDelay = viewModel::setSmartCallDelay,
+            onToggleSmartCallSpamAlert = viewModel::toggleSmartCallSpamAlert,
+            onSaveSmartCallOwnerName = viewModel::saveSmartCallOwnerName,
+            onRequestPhonePermissions = {
+                val perms = buildList {
+                    add(Manifest.permission.READ_PHONE_STATE)
+                    add(Manifest.permission.READ_CALL_LOG)
+                    add(Manifest.permission.ANSWER_PHONE_CALLS)
+                    add(Manifest.permission.READ_CONTACTS)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        add(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }.toTypedArray()
+                multiPermissionLauncher.launch(perms)
+            },
+            onRequestDefaultDialerRole = {
+                val intent = SmartCallManager.createRequestDialerRoleIntent(context)
+                if (intent != null) {
+                    dialerRoleLauncher.launch(intent)
+                } else {
+                    viewModel.refreshSystemStatuses()
+                }
+            },
+            onStartSmartCallTestTimer = viewModel::startSmartCallTestTimer,
+            onCancelSmartCall = viewModel::cancelSmartCall,
+            onDeleteCallSummary = viewModel::deleteCallSummary,
+            onToggleHabitPredictor = viewModel::toggleHabitPredictor,
+            onRefreshHabitPredictions = viewModel::refreshHabitPredictions,
+            onRunPredictedHabit = viewModel::runPredictedHabit,
+            onIgnorePredictedHabit = viewModel::ignorePredictedHabit,
+            onClearHabits = viewModel::clearHabits,
             onAddMemory = viewModel::addMemory,
             onUpdateMemory = viewModel::updateMemory,
             onDeleteMemory = viewModel::deleteMemory,

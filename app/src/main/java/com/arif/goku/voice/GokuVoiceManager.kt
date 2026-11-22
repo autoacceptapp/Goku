@@ -62,6 +62,8 @@ class GokuVoiceManager(
     private var isDestroyed = false
     private var currentTtsVolume: Float = 1.0f
     private var currentSpeechRate: Float = 1.0f
+    @Volatile
+    private var pendingUtteranceCallback: Pair<Int, () -> Unit>? = null
 
     private val _status = MutableStateFlow(
         VoiceUiStatus(
@@ -162,10 +164,30 @@ class GokuVoiceManager(
      * automatically opens the mic for 6 seconds upon completion.
      */
     fun speakHindi(text: String, reopenMicAfterSpeaking: Boolean = true) {
+        speakHindiInternal(text, reopenMicAfterSpeaking, onDoneCallback = null)
+    }
+
+    /**
+     * Phase 6 Smart Call hook: speaks Hindi greeting on speakerphone and invokes [onFinished]
+     * as soon as TTS finishes (so SmartCallManager can start listening for the caller's message).
+     */
+    fun speakHindiWithCallback(text: String, onFinished: () -> Unit) {
+        speakHindiInternal(text, reopenMicAfterSpeaking = false, onDoneCallback = onFinished)
+    }
+
+    private fun speakHindiInternal(
+        text: String,
+        reopenMicAfterSpeaking: Boolean,
+        onDoneCallback: (() -> Unit)?
+    ) {
         val cleaned = text.trim()
-        if (cleaned.isEmpty() || isDestroyed) return
+        if (cleaned.isEmpty() || isDestroyed) {
+            onDoneCallback?.invoke()
+            return
+        }
 
         val gen = sessionGeneration.incrementAndGet()
+        pendingUtteranceCallback = if (onDoneCallback != null) gen to onDoneCallback else null
         cancelContinuousTimer()
 
         mainHandler.post {
@@ -175,6 +197,9 @@ class GokuVoiceManager(
             if (tts == null) {
                 WakeWordBridge.setCapturePaused(false)
                 _status.value = _status.value.copy(engineState = VoiceEngineState.IDLE)
+                val cb = pendingUtteranceCallback?.takeIf { it.first == gen }?.second
+                pendingUtteranceCallback = null
+                cb?.invoke()
                 return@post
             }
             // Enforce Hindi locale & Smart Context volume/rate before speaking
@@ -283,6 +308,7 @@ class GokuVoiceManager(
      */
     fun emergencyStop() {
         sessionGeneration.incrementAndGet()
+        pendingUtteranceCallback = null
         cancelContinuousTimer()
         mainHandler.post {
             try {
@@ -315,6 +341,23 @@ class GokuVoiceManager(
     private fun handleTtsFinished(expectedGen: Int?, allowContinuous: Boolean) {
         if (isDestroyed) return
         if (expectedGen == null || expectedGen != sessionGeneration.get()) return
+
+        val callback = pendingUtteranceCallback?.takeIf { it.first == expectedGen }?.second
+        if (callback != null) {
+            pendingUtteranceCallback = null
+            _status.value = _status.value.copy(
+                engineState = VoiceEngineState.IDLE,
+                audioLevel = 0f,
+                continuousSecondsLeft = 0
+            )
+            scope.launch {
+                delay(280L)
+                if (!isDestroyed && sessionGeneration.get() == expectedGen) {
+                    callback()
+                }
+            }
+            return
+        }
 
         if (allowContinuous && isContinuousModeEnabled()) {
             // Brief 280ms acoustic guard so mic doesn't pick up trailing speaker echo
