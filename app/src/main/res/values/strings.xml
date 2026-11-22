@@ -1,0 +1,62 @@
+<resources>
+    <string name="app_name">GokuAgent</string>
+    <string name="accessibility_service_label">GokuAgent Control</string>
+    <string name="notification_listener_label">GokuAgent Notification Brain</string>
+    <string name="accessibility_service_description">Allows GokuAgent to read active screen context and perform clicks, typing, scrolling, and navigation actions when you request or confirm them.</string>
+
+    <!-- Dashboard & HUD -->
+    <string name="hud_subtitle">JARVIS CORE • PHASE 2 DUAL-ENGINE</string>
+    <string name="status_brain_label">BRAIN</string>
+    <string name="status_adb_label">LOCAL ADB</string>
+    <string name="status_access_label">ACCESS</string>
+    <string name="status_online">Online</string>
+    <string name="status_offline">Offline</string>
+    <string name="status_no_key">No Key</string>
+    <string name="status_active">Active</string>
+    <string name="status_inactive">Inactive</string>
+    <string name="status_adb_connected">127.0.0.1:5555</string>
+    <string name="status_adb_disconnected">Disconnected</string>
+
+    <!-- Orb & Kill Switch -->
+    <string name="orb_tap_to_talk">Tap to Talk</string>
+    <string name="orb_listening">Sun raha hoon…</string>
+    <string name="orb_thinking">Soch raha hoon…</string>
+    <string name="orb_speaking">Goku bol raha hai…</string>
+    <string name="kill_switch_label">GOKU STOP</string>
+    <string name="continuous_mode_badge">Continuous Mic</string>
+
+    <!-- Chat & Input -->
+    <string name="chat_empty_title">Namaste! Main Goku hoon.</string>
+    <string name="chat_empty_subtitle">Orb dabaiye ya neeche type kijiye — Hindi aur Hinglish dono mein baat kar sakte hain. Pehle Settings mein apna Gemini API Key save karein.</string>
+    <string name="chat_input_hint">Goku se Hindi ya Hinglish mein poochiye…</string>
+    <string name="cd_send_message">Send message</string>
+    <string name="cd_open_settings">Open Settings</string>
+    <string name="cd_clear_chat">Clear conversation</string>
+    <string name="cd_goku_orb">Goku voice orb button</string>
+    <string name="cd_emergency_stop">Emergency Goku Stop kill switch</string>
+
+    <!-- Safety Guard Dialog -->
+    <string name="safety_dialog_title">Safety Confirmation Required</string>
+    <string name="safety_confirm_button">Confirm Action</string>
+    <string name="safety_cancel_button">Cancel / Stop</string>
+
+    <!-- Settings Sheet -->
+    <string name="settings_title">GokuAgent Control Setup</string>
+    <string name="settings_api_key_label">Gemini API Key (Encrypted)</string>
+    <string name="settings_api_key_placeholder">Paste your Google AI Studio key…</string>
+    <string name="settings_save_key">Save Key</string>
+    <string name="settings_clear_key">Clear</string>
+    <string name="settings_continuous_title">Continuous Listening (6s Window)</string>
+    <string name="settings_continuous_desc">Automatically re-opens mic for 6 seconds after Goku finishes speaking, unless you say \"Goku stop\".</string>
+    <string name="settings_adb_title">Local Wireless ADB (127.0.0.1:5555)</string>
+    <string name="settings_adb_pair_port">Pairing Port</string>
+    <string name="settings_adb_pair_code">6-Digit Pairing Code</string>
+    <string name="settings_adb_connect_port">Connect Port (Optional)</string>
+    <string name="settings_adb_probe">Check 127.0.0.1:5555</string>
+    <string name="settings_adb_pair_btn">Prepare / Pair</string>
+    <string name="settings_adb_dev_options">Open Dev Options</string>
+    <string name="settings_accessibility_title">Accessibility Service</string>
+    <string name="settings_accessibility_open">Open Accessibility Settings</string>
+    <string name="settings_overlay_title">Overlay Permission</string>
+    <string name="settings_overlay_open">Grant Overlay Access</string>
+</resources>

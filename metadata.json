@@ -1,0 +1,6 @@
+{
+  "name": "GokuAgent",
+  "description": "Jarvis-style Hindi voice AI companion with Gemini chat, continuous listening, emergency kill switch, local ADB setup, and Accessibility actions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
