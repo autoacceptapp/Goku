@@ -1,6 +1,11 @@
 package com.arif.goku.voice
 
 import android.content.Context
+import com.k2fsa.sherpa.onnx.FeatureConfig
+import com.k2fsa.sherpa.onnx.KeywordSpotter
+import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
+import com.k2fsa.sherpa.onnx.OnlineModelConfig
+import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -84,6 +89,56 @@ class KwsModelManager(context: Context) {
     fun getTokensFile(): File? = File(modelDir, "tokens.txt").takeIf { it.isFile }
 
     fun getKeywordsFile(): File? = File(modelDir, "keywords.txt").takeIf { it.isFile }
+
+    /**
+     * Instantiates the official Sherpa-ONNX [KeywordSpotter] backed by the locally downloaded
+     * Zipformer GigaSpeech ONNX model and `keywords.txt` ("HEY GOKU" & "GOKU STOP").
+     *
+     * Returns `null` if ONNX files are missing or native runtime initialization fails (e.g. JVM
+     * unit tests or unsupported ABI), allowing [WakeWordService] to fall back cleanly to VAD.
+     */
+    fun createKeywordSpotter(): KeywordSpotter? {
+        val encoder = getEncoderFile() ?: return null
+        val decoder = getDecoderFile() ?: return null
+        val joiner = getJoinerFile() ?: return null
+        val tokens = getTokensFile() ?: return null
+        val keywordsFile = getKeywordsFile() ?: run {
+            try {
+                writeKeywordsConfig(modelDir)
+                getKeywordsFile()
+            } catch (_: Exception) {
+                null
+            }
+        } ?: return null
+
+        return try {
+            val config = KeywordSpotterConfig(
+                featConfig = FeatureConfig(
+                    sampleRate = 16000,
+                    featureDim = 80
+                ),
+                modelConfig = OnlineModelConfig(
+                    transducer = OnlineTransducerModelConfig(
+                        encoder = encoder.absolutePath,
+                        decoder = decoder.absolutePath,
+                        joiner = joiner.absolutePath
+                    ),
+                    tokens = tokens.absolutePath,
+                    numThreads = 2,
+                    debug = false,
+                    provider = "cpu"
+                ),
+                maxActivePaths = 4,
+                keywordsFile = keywordsFile.absolutePath,
+                keywordsScore = 1.5f,
+                keywordsThreshold = 0.25f,
+                numTrailingBlanks = 2
+            )
+            KeywordSpotter(assetManager = null, config = config)
+        } catch (_: Throwable) {
+            null
+        }
+    }
 
     fun cancelDownload() {
         activeCall.getAndSet(null)?.cancel()
@@ -304,7 +359,11 @@ class KwsModelManager(context: Context) {
 
         fun isSherpaOnnxClassAvailable(): Boolean {
             return try {
-                Class.forName("com.k2fsa.sherpa.onnx.KeywordSpotter")
+                Class.forName(
+                    "com.k2fsa.sherpa.onnx.KeywordSpotter",
+                    false,
+                    KwsModelManager::class.java.classLoader
+                )
                 true
             } catch (_: Throwable) {
                 false

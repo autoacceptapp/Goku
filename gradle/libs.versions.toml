@@ -44,6 +44,7 @@ securityCrypto = "1.1.0-alpha06"
 commonsCompress = "1.27.1"
 mediapipeTasksGenai = "0.10.22"
 workRuntimeKtx = "2.10.0"
+sherpaOnnx = "v2.0.1"
 
 
 [libraries]
@@ -92,6 +93,7 @@ androidx-security-crypto = { group = "androidx.security", name = "security-crypt
 commons-compress = { group = "org.apache.commons", name = "commons-compress", version.ref = "commonsCompress" }
 mediapipe-tasks-genai = { group = "com.google.mediapipe", name = "tasks-genai", version.ref = "mediapipeTasksGenai" }
 androidx-work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "workRuntimeKtx" }
+sherpa-onnx = { group = "com.github.k2-fsa", name = "sherpa-onnx", version.ref = "sherpaOnnx" }
 robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
 firebase-bom = { group = "com.google.firebase", name = "firebase-bom", version.ref = "firebaseBom" }
 firebase-ai = { group = "com.google.firebase", name = "firebase-ai" }

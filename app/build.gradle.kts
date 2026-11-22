@@ -109,6 +109,9 @@ dependencies {
   implementation(libs.commons.compress)
   implementation(libs.mediapipe.tasks.genai)
   implementation(libs.androidx.work.runtime.ktx)
+  implementation(libs.sherpa.onnx) {
+    exclude(group = "com.github.k2-fsa.sherpa-onnx", module = "sherpa-onnx-jvm")
+  }
   // implementation(libs.coil.compose)
   // implementation(libs.converter.moshi)
   // implementation(libs.firebase.ai)
